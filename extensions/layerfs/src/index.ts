@@ -80,6 +80,14 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       : "";
   }
 
+  const recordSession = (s: LayerfsSession) =>
+    pi.appendEntry(SESSION_ENTRY, { project: s.project, volume: s.volume, cwd: s.cwd, baseBranch: s.baseBranch, workBranch: s.workBranch, baseRef: s.baseRef, headCommit: s.headCommit });
+  const recordMerge = (s: LayerfsSession, other: string, r: { head: string | null; branch: string }) => {
+    if (r.head) pi.appendEntry(CHECKPOINT_ENTRY, { origins: [`merge:${other}`], label: "merge", commit: r.head, branch: r.branch, changed: true, at: Date.now(), project: s.project });
+    recordSession(s);
+  };
+  const applicableDiff = async (s: LayerfsSession) => (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path) && s.isApplicable(i.path));
+
   const withNote = (result: any, note: string) =>
     note ? { ...result, content: [...(result.content ?? []), { type: "text", text: note }] } : result;
 
@@ -161,6 +169,108 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       return { content: [{ type: "text" as const, text: t.content + (notes.length ? `\n\n[${notes.join(". ")}]` : "") }], details: undefined };
     },
   });
+
+  // ------------------------------------------------------------- team mode (PI_LAYERFS_TEAM=1)
+  // Agent-facing branch tools for multi-agent runs. `layerfs` is for every session (lead and
+  // sub-agents); `layerfs_apply` (writes the user's folder) only for the top-level session:
+  // pi-subagents children (PI_SUBAGENT_CHILD=1) never get it.
+  const boot = resolveConfig();
+  const isChild = process.env.PI_SUBAGENT_CHILD === "1";
+  if (boot.team && boot.enabled) {
+    const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: undefined });
+    pi.registerTool({
+      name: "layerfs",
+      label: "LayerFS",
+      description: [
+        "Inspect and combine LayerFS branches of this project (your file tools and bash work on your own branch).",
+        "action=status: your branch name (report it to whoever merges your work), head, whether you have unapplied changes.",
+        "action=diff: files your branch changed (build output that never reaches the user's folder is counted, not listed).",
+        "action=branches: all branches of the project.",
+        "action=sync: merge the project's trunk (main: what was last applied to the user's folder) into your branch.",
+        "action=merge branch=<name>: merge another branch (e.g. a teammate's) into yours. On conflict nothing changes and the conflicting files are listed.",
+      ].join(" "),
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["status", "diff", "branches", "sync", "merge"] },
+          branch: { type: "string", description: "branch to merge (action=merge)" },
+        },
+        required: ["action"],
+        additionalProperties: false,
+      } as any,
+      async execute(_id: string, params: any, _signal: any, _onUpdate: any, ctx: ExtensionContext) {
+        if (disabled) return text("LayerFS is off for this run: there are no branches; tools act on the user's folder.");
+        const s = await need();
+        const action = params?.action;
+        if (action === "status") {
+          return text([
+            `branch: ${s.workBranch}`,
+            `head: ${s.headCommit ?? "none (no changes yet)"}`,
+            `unapplied changes: ${s.unapplied ? "yes" : "no"}`,
+            s.blocked ? `BLOCKED: ${s.blocked.reason}` : "",
+          ].filter(Boolean).join("\n"));
+        }
+        if (action === "diff") {
+          const all = (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path));
+          const d = all.filter((i) => s.isApplicable(i.path));
+          const lines = d.slice(0, 300).map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`);
+          if (d.length > 300) lines.push(`… ${d.length - 300} more`);
+          const other = all.length - d.length;
+          if (other) lines.push(`(+${other} branch-only/build files, never applied)`);
+          return text(lines.length ? lines.join("\n") : "No changes on this branch.");
+        }
+        if (action === "branches") {
+          const list = await s.listAllBranches();
+          return text(list.map((b) => `${b.name}${b.name === s.workBranch ? " (yours)" : ""} head ${(b.head ?? "-").slice(0, 12)}`).join("\n"));
+        }
+        if (action === "sync" || action === "merge") {
+          const other = action === "sync" ? "main" : String(params?.branch ?? "").trim();
+          if (!other) throw new Error("action=merge needs branch=<name> (see action=branches)");
+          if (other === s.workBranch) throw new Error("that is your own branch");
+          const r = await s.mergeBranch(other);
+          status(ctx, describe(s));
+          if (!r.merged) {
+            return text([
+              `CONFLICT merging ${other}: nothing changed (you are still on ${s.workBranch}).`,
+              "Conflicting files:", ...r.conflicts.map((c) => `  ${c.path}${c.kind ? ` (${c.kind})` : ""}`),
+              "Resolve: make your branch's version of these files match what the merged result should be (or ask the other branch's owner to), then merge again.",
+            ].join("\n"));
+          }
+          recordMerge(s, other, r);
+          return text(`Merged ${other}. You are now on ${r.branch}${r.lww ? ` (${r.lww} generated file(s) took the newer side)` : ""}.`);
+        }
+        throw new Error(`unknown action ${action}`);
+      },
+    } as any);
+
+    if (!isChild) {
+      pi.registerTool({
+        name: "layerfs_apply",
+        label: "LayerFS apply",
+        description: "Write your branch's changes into the user's real project folder and advance the trunk (main), so new sessions and sub-agents start from it. Three-way checked: if a file changed in the folder meanwhile, nothing is written and the files are listed. Build output marked branch-only is never written.",
+        parameters: { type: "object", properties: {}, additionalProperties: false } as any,
+        async execute(_id: string, _params: any, _signal: any, _onUpdate: any, ctx: ExtensionContext) {
+          if (disabled) return text("LayerFS is off for this run: your edits are already in the user's folder.");
+          const s = await need();
+          let r;
+          try {
+            r = await s.apply();
+          } catch (e: any) {
+            status(ctx, describe(s));
+            const partial = e?.result as { applied: string[] } | undefined;
+            throw new Error(`apply stopped: ${e?.message ?? e}${partial?.applied.length ? ` (already written: ${partial.applied.join(", ")})` : " (nothing was written)"}`);
+          }
+          status(ctx, describe(s));
+          recordSession(s);
+          if (r.conflicts.length) return text(`Nothing applied: these files changed in the user's folder since your branch started:\n${r.conflicts.join("\n")}`);
+          return text([
+            r.applied.length ? `Applied ${r.applied.length} file(s) to ${s.cwd}; main now includes your branch.` : "No source changes to write; main now includes your branch.",
+            ...r.warnings.map((w) => `Warning: ${w}`),
+          ].join("\n"));
+        },
+      } as any);
+    }
+  }
 
   pi.on("user_bash", async (_event, ctx) => {
     if (disabled) return undefined;
@@ -286,6 +396,11 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       `Paths under ${session?.cwd ?? "the working directory"} refer to that Branch; edits there do NOT reach the user's folder until the user runs /layerfs apply.`,
       "Files outside the working directory are read-only. Secret files such as .env are not imported.",
       "Each bash call runs in its own sandbox: background processes (`cmd &`, dev servers) end when that call ends. Start and use a server within one bash call.",
+      ...(resolveConfig().team ? [
+        isChild
+          ? "Team mode: you work on your own branch. Use the `layerfs` tool (status/diff/sync); report your branch name from `layerfs status` when you finish. You cannot write the user's folder."
+          : "Team mode: the `layerfs` tool merges other branches (e.g. sub-agents') into yours; `layerfs_apply` writes your branch into the user's folder and advances main, which new sub-agents start from.",
+      ] : []),
     ].join("\n");
     return { systemPrompt: `${event.systemPrompt}\n${note}` };
   });
@@ -343,12 +458,11 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         const r = await s.mergeBranch(other);
         status(ctx, describe(s));
         if (!r.merged) return say([`Conflict merging ${other}; nothing changed. Conflicting files:`, ...r.conflicts.map((c) => `  ${c.path}${c.kind ? ` (${c.kind})` : ""}`)].join("\n"), "error");
-        if (r.head) pi.appendEntry(CHECKPOINT_ENTRY, { origins: [`merge:${other}`], label: "merge", commit: r.head, branch: r.branch, changed: true, at: Date.now(), project: s.project });
-        pi.appendEntry(SESSION_ENTRY, { project: s.project, volume: s.volume, cwd: s.cwd, baseBranch: s.baseBranch, workBranch: s.workBranch, baseRef: s.baseRef, headCommit: s.headCommit });
+        recordMerge(s, other, r);
         return say(`Merged ${other} into this session (now on ${r.branch}${r.lww ? `, ${r.lww} generated file(s) took the newer side` : ""}). /layerfs diff to review, /layerfs apply to write to your folder.`);
       }
       if (sub === "diff") {
-        const d = (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path));
+        const d = await applicableDiff(s);
         return say(d.length ? d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`).join("\n") : "No changes in the LayerFS workspace.");
       }
       if (sub === "sync") {
@@ -362,7 +476,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       }
       if (sub === "apply") {
         const allowRevert = argv.includes("--revert");
-        const d = (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path));
+        const d = await applicableDiff(s);
         if (!d.length) return say("Nothing to apply.");
         if (ctx.hasUI && !(await ctx.ui.confirm("Apply LayerFS changes to your folder?", d.map((i) => `${i.kind} ${i.path}`).slice(0, 40).join("\n")))) return say("Apply cancelled.");
         let r;

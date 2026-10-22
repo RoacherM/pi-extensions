@@ -320,7 +320,47 @@ try {
     const c = await lead.mergeBranch(w2.workBranch);
     assert.equal(c.merged, false);
     assert.deepEqual(c.conflicts.map((x) => x.path), ["a.txt"]);
+    // sync: an older session merges main (advanced by the lead's apply) into its branch
+    const late = await open(cwd, "mlate");
+    const lead2 = await open(cwd, "ml2");
+    await lead2.mutate("5", "write", () => lead2.writeFile(join(cwd, "trunk.txt"), "trunk\n"));
+    await lead2.apply();
+    assert.equal(await late.exists(join(cwd, "trunk.txt")), false);
+    const sy = await late.mergeBranch("main");
+    assert.ok(sy.merged, JSON.stringify(sy.conflicts));
+    assert.equal((await late.readFile(join(cwd, "trunk.txt"))).toString(), "trunk\n", "sync brings main in");
     void alias;
+  });
+
+  await step("branch-only: target/ stays in branches, is never applied, survives a full sync, host target/ is not drift", async () => {
+    const cwd = project();
+    const bcfg = { ...config, branchOnly: ["target/", ".cargo-home/"] };
+    const mk = async (name) => { const s = new LayerfsSession(cwd, `${name}-${id}`, bcfg); sessions.push(s); await s.open(); return s; };
+    mkdirSync(join(cwd, "target"), { recursive: true });
+    writeFileSync(join(cwd, "target/host-only.bin"), "host build\n"); // a host build dir: never imported
+    const a = await mk("bo1");
+    assert.equal(await a.exists(join(cwd, "target/host-only.bin")), false, "host target/ not imported");
+    const out1 = out();
+    await a.mutate("b", "bash", () => a.exec("mkdir -p target/debug && echo artifact > target/debug/app && echo src > lib.rs", cwd, out1));
+    assert.ok(a.unapplied);
+    const r = await a.apply();
+    assert.deepEqual(r.applied, ["lib.rs"], "only source is applied");
+    assert.equal(existsSync(join(cwd, "target/debug/app")), false, "artifact never reaches the host");
+    assert.equal(a.unapplied, false, "branch-only changes do not count as unapplied");
+    // full sync (host vs main) must not delete target/ from main
+    const sy = await a.syncHostDriftIntoMain({ full: true });
+    assert.deepEqual(sy.synced, [], `nothing to sync, got ${sy.synced}`);
+    const b = await mk("bo2"); // new session forks from main: inherits the build cache
+    assert.equal((await b.readFile(join(cwd, "target/debug/app"))).toString(), "artifact\n", "new session inherits target/ from main");
+    // host edits to target/ are not drift
+    writeFileSync(join(cwd, "target/host-only.bin"), "changed\n");
+    assert.deepEqual((await b.syncHostDriftIntoMain()).synced, []);
+    // team merge: two sessions both rebuilt target/: lww takes the newer side, no conflict
+    const o2 = out(), o3 = out();
+    await a.mutate("c", "bash", () => a.exec("echo a > target/debug/app && echo a > a-src.rs", cwd, o2));
+    await b.mutate("d", "bash", () => b.exec("echo b > target/debug/app && echo b > b-src.rs", cwd, o3));
+    const m = await a.mergeBranch(b.workBranch);
+    assert.ok(m.merged, `merge with both target/ edits: ${JSON.stringify(m.conflicts)}`);
   });
 
 } finally {

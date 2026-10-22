@@ -165,13 +165,13 @@ export class LayerfsSession {
       try {
         // The JS matcher decides what is imported; rsync copies exactly that list (no pattern dialects).
         const list = join(this.config.root, "staging", `${name}-${created}.files`);
-        await fsp.writeFile(list, (await listImportable(this.cwd, this.config.excludes)).join("\0"));
+        await fsp.writeFile(list, (await listImportable(this.cwd, this.hostSkip)).join("\0"));
         const rs = await runLocal("rsync", ["-a", "--no-implied-dirs", "--links", "--from0", `--files-from=${list}`, `${this.cwd}/`, `${staged}/`]);
         await fsp.rm(list, { force: true });
         if (rs.code !== 0) throw new LayerfsError("Failed", `staging copy failed: ${rs.stderr.slice(0, 400)}`);
         // Index the staged copy, i.e. exactly what is imported (impl review P1-7); keep host mtimes
         // so the next start can use the fast path for unchanged files.
-        const stagedScan = await scanHostDirectory(staged, this.config.excludes, {}, true);
+        const stagedScan = await scanHostDirectory(staged, this.hostSkip, {}, true);
         const hostIndex: HostIndex = {};
         for (const [rel, ent] of Object.entries(stagedScan.index)) {
           // rsync -a keeps mtimes: the staged mtime is the host mtime at copy time. If the host file
@@ -181,7 +181,8 @@ export class LayerfsSession {
         const lwwPath = join(staged, ".lww");
         const hadLww = await fsp.access(lwwPath).then(() => true, () => false);
         // .git/ metadata (index, logs) differs per session: keep the newer copy instead of conflicting
-        if (!hadLww) await fsp.writeFile(lwwPath, LWW_DEFAULT);
+        // branch-only build output (target/, caches) is generated: the newer side wins on merge too
+        if (!hadLww) await fsp.writeFile(lwwPath, LWW_DEFAULT + this.config.branchOnly.map((p) => `${p}\n`).join(""));
 
         await ok(this.config.docker, ["volume", "create", "--label", "pi-layerfs.role=project", "--label", `pi-layerfs.project=${name}`, volume]);
         const record: ProjectRecord = { name, source: this.cwd, volume, image: imageId, mainRef: "", created, updatedAt: created };
@@ -218,7 +219,7 @@ export class LayerfsSession {
       // Full mode compares the host against main's actual content, not against the host index:
       // after a failed publish the index matches the host while main lags behind (impl review P0-2).
       const prev = full ? await this.mainIndex() : this.bindings.readHostIndex(this.projectRecord.name);
-      const scanned = await scanHostDirectory(this.cwd, this.config.excludes, full ? {} : prev, true);
+      const scanned = await scanHostDirectory(this.cwd, this.hostSkip, full ? {} : prev, true);
       const curr = scanned.index;
       const changed: string[] = [];
       const removed: string[] = [];
@@ -298,7 +299,7 @@ export class LayerfsSession {
         const [t, rel, a, b] = rec.split("\t");
         // same filter as scanHostDirectory: .lww and temp files at any depth, excludes
         const name = posix.basename(rel);
-        if (name === ".lww" || name.includes(".pi-layerfs-") || isExcludedPath(rel, this.config.excludes)) continue;
+        if (name === ".lww" || name.includes(".pi-layerfs-") || isExcludedPath(rel, this.hostSkip)) continue;
         index[rel] = t === "L" ? linkSig(a) : { kind: "file", sig: a, mode: parseInt(b || "644", 8) };
       }
       return index;
@@ -317,7 +318,7 @@ export class LayerfsSession {
         this.workBranch = saved.workBranch!;
         this.baseRef = saved.baseRef ?? bb.head ?? bb.base;
         this.headCommit = wb.head ?? null;
-        this.unapplied = (await this.diff()).filter((i) => i.type !== "dir").length > 0;
+        this.unapplied = await this.hasApplicable();
         return;
       }
       if (targetRef && bb) {
@@ -327,7 +328,7 @@ export class LayerfsSession {
         this.workBranch = `s-${this.shortId}-${this.seq}`;
         const f = await this.lfs.branch.fork(this.workBranch, targetRef);
         this.headCommit = f.head ?? null;
-        this.unapplied = (await this.diff()).filter((i) => i.type !== "dir").length > 0;
+        this.unapplied = await this.hasApplicable();
         return;
       }
     }
@@ -355,7 +356,7 @@ export class LayerfsSession {
       this.headCommit = forked.head ?? (ref !== this.baseRef ? ref : null);
       this.blocked = null;
       this.pendingOrigins = [];
-      this.unapplied = (await this.diff()).filter((i) => i.type !== "dir").length > 0;
+      this.unapplied = await this.hasApplicable();
       this.persistSessionBinding();
       return { branch: this.workBranch, ref: this.effectiveRef };
     });
@@ -379,7 +380,7 @@ export class LayerfsSession {
         const m = await this.lfs.branch.merge(this.workBranch, other, target, `merge ${other} into ${this.workBranch}`);
         this.workBranch = target;
         this.headCommit = m.head ?? this.headCommit;
-        this.unapplied = (await this.diff()).filter((i) => i.type !== "dir").length > 0;
+        this.unapplied = await this.hasApplicable();
         this.persistSessionBinding();
         if (m.head) this.checkpoints.push({ origins: [`merge:${other}`], label: "merge", commit: m.head, branch: target, changed: true, at: Date.now() });
         return { merged: true, branch: target, head: m.head ?? null, conflicts: [], lww: (m.lww ?? []).length };
@@ -878,7 +879,7 @@ export class LayerfsSession {
         this.blocked = { reason: "a cancelled command could not be stopped inside the Sandbox", heldWs: ws };
         throw killFailed;
       }
-      await this.dexec(container, ident, `if [ ! -f "$1/.lww" ]; then printf %s "$2" > "$1/.lww"; fi`, [ws.path, LWW_DEFAULT]).catch(() => {});
+      await this.dexec(container, ident, `if [ ! -f "$1/.lww" ]; then printf %s "$2" > "$1/.lww"; fi`, [ws.path, LWW_DEFAULT + this.config.branchOnly.map((p) => `${p}\n`).join("")]).catch(() => {});
 
       // Always try to commit what the command changed, even after failures (impl review P1-13)
       const msg = `pi bash (exit ${code ?? "sig"}) [${this.pendingOrigins.join(",") || "bash"}]`.slice(0, 4000);
@@ -1048,6 +1049,21 @@ export class LayerfsSession {
   // ---------------------------------------------------------------- diff & apply (P0-1, P0-4 fixes)
 
   /** Diffs this session's `baseBranch` against `workBranch` (never against a moving `"main"`). */
+  /** Patterns the host side never sees: secrets (excludes) and branch-only build output. */
+  get hostSkip(): string[] {
+    return this.config.branchOnly.length ? [...this.config.excludes, ...this.config.branchOnly] : this.config.excludes;
+  }
+
+  /** True if a diff path would be written by apply (not .git, .lww, excludes or branch-only). */
+  isApplicable(path: string): boolean {
+    const rel = path.replace(/^\/+/, "");
+    return !(rel === ".lww" || rel === ".git" || rel.startsWith(".git/") || isExcludedPath(rel, this.hostSkip));
+  }
+
+  async hasApplicable(): Promise<boolean> {
+    return (await this.diff()).some((i) => i.type !== "dir" && this.isApplicable(i.path));
+  }
+
   async diff(): Promise<Array<{ path: string; kind: string; type: string }>> {
     const items: Array<{ path: string; kind: string; type: string }> = [];
     for (let pos = 0; ; ) {
@@ -1121,11 +1137,16 @@ export class LayerfsSession {
       const items: Array<{ path: string; kind: string; type: string }> = [];
       for (let pos = 0; ; ) {
         const page = await this.lfs.branch.diff_branches(this.baseBranch, snapBranch, 1000, pos, { hunks: false });
-        for (const it of page.items ?? []) if (it.type !== "dir") items.push({ path: it.path, kind: it.kind, type: it.type });
+        for (const it of page.items ?? []) {
+          // branch-only build output is never applied (and not even listed as skipped)
+          if (it.type !== "dir" && !(this.config.branchOnly.length && isExcludedPath(it.path.replace(/^\/+/, ""), this.config.branchOnly))) {
+            items.push({ path: it.path, kind: it.kind, type: it.type });
+          }
+        }
         if (!page.hasMore || !(page.items ?? []).length) break;
         pos = page.nextPagePos ?? (pos + page.items.length);
       }
-      if (!items.length) {
+      if (!items.length && !this.config.branchOnly.length) {
         this.unapplied = false;
         this.persistSessionBinding();
         return result;
@@ -1137,7 +1158,7 @@ export class LayerfsSession {
       await this.withMountedBranch(snapBranch, false, "apply read", async (ctr, ident, wsPath) => {
         for (const it of items) {
           const rel = it.path.replace(/^\/+/, "");
-          if (rel === ".lww" || rel === ".git" || rel.startsWith(".git/") || isExcludedPath(rel, this.config.excludes)) {
+          if (rel === ".lww" || rel === ".git" || rel.startsWith(".git/") || isExcludedPath(rel, this.hostSkip)) {
             result.skipped.push(rel);
             continue;
           }

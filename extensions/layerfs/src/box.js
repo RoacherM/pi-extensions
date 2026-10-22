@@ -85,8 +85,19 @@ export function connectBoxSocket(box, sockPath) {
 let starting = null;
 /** Starts the Store container and its worker unless they run, and writes storeFile; one start at a time. */
 export function ensureBox(spec) {
-  starting ??= start(spec).finally(() => { starting = null; });
+  starting ??= startRetrying(spec).finally(() => { starting = null; });
   return starting;
+}
+
+/** Another process may create the Store container at the same moment: on a name clash, reuse it. */
+async function startRetrying(spec) {
+  for (let attempt = 1; ; attempt++) {
+    try { return await start(spec); } catch (e) {
+      const msg = String(e?.message ?? e);
+      if (attempt >= 4 || !/already in use|Conflict|No such container|is not running|removal of container/i.test(msg)) throw e;
+      await new Promise((r) => setTimeout(r, 300 * attempt + Math.floor(Math.random() * 300)));
+    }
+  }
 }
 
 async function start(spec) {
@@ -132,8 +143,10 @@ async function start(spec) {
   }
   await listening(spec.box, sock, secret);
   const file = storeFile(spec.home);
-  writeFileSync(`${file}.tmp`, JSON.stringify({ box: spec.box, sock, secret }), { mode: 0o600 });
-  renameSync(`${file}.tmp`, file);
+  // unique tmp per writer: several Pi processes (e.g. parallel sub-agents) may start at once
+  const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ box: spec.box, sock, secret }), { mode: 0o600 });
+  renameSync(tmp, file);
 }
 
 /** Waits until the worker answers a ping over its Unix socket. */

@@ -19,6 +19,14 @@ export interface LayerfsConfig {
   killGraceMs: number;
   /** env vars forwarded into commands (besides PI_*) */
   envAllow: string[];
+  /**
+   * Paths that live only in LayerFS branches (build output, caches: e.g. target/, .cargo-home/):
+   * never imported from the host, never seen by host sync (so a full sync does not delete them
+   * from main), never written by apply. Visible to the agent inside its branch. Empty by default.
+   */
+  branchOnly: string[];
+  /** team mode: agent-facing `layerfs` tool (+ `layerfs_apply` for the top-level session) */
+  team: boolean;
 }
 
 export const DEFAULT_EXCLUDES = [
@@ -38,5 +46,7 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): LayerfsConf
     excludes: list(env.PI_LAYERFS_EXCLUDES, DEFAULT_EXCLUDES),
     killGraceMs: Number(env.PI_LAYERFS_KILL_GRACE_MS ?? 2000),
     envAllow: list(env.PI_LAYERFS_ENV_ALLOW, ["TERM", "LANG", "LC_ALL", "CI", "NO_COLOR", "FORCE_COLOR"]),
+    branchOnly: list(env.PI_LAYERFS_BRANCH_ONLY, []),
+    team: env.PI_LAYERFS_TEAM === "1",
   };
 }
