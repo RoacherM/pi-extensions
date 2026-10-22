@@ -11,6 +11,8 @@ export interface HistoryRow {
   label: string;
   files: HistoryFile[];
   filesMore: boolean;
+  /** build-output files (branch-only) changed in this commit: counted, not listed */
+  build?: number;
   isHead: boolean;
   applied: boolean;
 }
@@ -45,10 +47,15 @@ async function changedFiles(s: LayerfsSession, from: string | null, to: string):
     ? await s.lfs.branch.diff_commits(from, to, 200, 0, { hunks: false })
     : null;
   const items = page?.items ?? [];
-  const files = items
-    .filter((i: any) => i.type !== "dir" && !hiddenPath(i.path))
-    .map((i: any) => ({ kind: i.kind, path: String(i.path).replace(/^\/+/, "") }));
-  return { files: files.slice(0, FILES_PER_ROW), more: files.length > FILES_PER_ROW || Boolean(page?.hasMore) };
+  return summarize(s, items, Boolean(page?.hasMore));
+}
+
+/** Source files first (build output marked branch-only is counted, not listed). */
+function summarize(s: LayerfsSession, items: any[], hasMore: boolean): { files: HistoryFile[]; more: boolean; build: number } {
+  const all = items.filter((i: any) => i.type !== "dir" && !hiddenPath(i.path));
+  const files = all.filter((i: any) => s.isApplicable(i.path)).map((i: any) => ({ kind: i.kind, path: String(i.path).replace(/^\/+/, "") }));
+  const build = all.length - files.length;
+  return { files: files.slice(0, FILES_PER_ROW), more: files.length > FILES_PER_ROW || (hasMore && build === 0), build: build + (hasMore && build > 0 ? 1 : 0) };
 }
 
 export async function loadHistory(s: LayerfsSession, limit = 20): Promise<HistoryView> {
@@ -60,13 +67,14 @@ export async function loadHistory(s: LayerfsSession, limit = 20): Promise<Histor
     const { label, origins } = parseMessage(c.message);
     let files: HistoryFile[] = [];
     let filesMore = false;
+    let build = 0;
     try {
       if (c.parent) {
-        ({ files, more: filesMore } = await changedFiles(s, c.parent, c.id));
+        ({ files, more: filesMore, build } = await changedFiles(s, c.parent, c.id));
       } else {
         // First Commit on the Branch: its parent is the base Layer, which diff_commits refuses.
         // Compare the Layer (as a Branch with no Commits) with a Branch pinned at this Commit.
-        ({ files, more: filesMore } = await firstCommitFiles(s, c));
+        ({ files, more: filesMore, build } = await firstCommitFiles(s, c));
       }
     } catch {
       // keep the row without its file list
@@ -79,12 +87,13 @@ export async function loadHistory(s: LayerfsSession, limit = 20): Promise<Histor
       label,
       files,
       filesMore,
+      build,
       isHead: c.id === s.headCommit,
       applied: applied.has(c.id),
     });
   }
   const unapplied = (await s.diff())
-    .filter((i) => i.type !== "dir" && !hiddenPath(i.path))
+    .filter((i) => i.type !== "dir" && !hiddenPath(i.path) && s.isApplicable(i.path))
     .map((i) => ({ kind: i.kind, path: i.path.replace(/^\/+/, "") }));
   return { project: s.project, branch: s.workBranch, baseRef: s.baseRef, rows, more: Boolean(page.hasMore), unapplied };
 }
@@ -107,10 +116,7 @@ async function firstCommitFiles(s: LayerfsSession, c: any): Promise<{ files: His
   const from = await pinBranch(s, c.base);
   const to = await pinBranch(s, c.id);
   const d = await s.lfs.branch.diff_branches(from, to, 200, 0, { hunks: false });
-  const files = (d.items ?? [])
-    .filter((i: any) => i.type !== "dir" && !hiddenPath(i.path))
-    .map((i: any) => ({ kind: i.kind, path: String(i.path).replace(/^\/+/, "") }));
-  return { files: files.slice(0, FILES_PER_ROW), more: files.length > FILES_PER_ROW || Boolean(d.hasMore) };
+  return summarize(s, d.items ?? [], Boolean(d.hasMore));
 }
 
 /** Commits at or before the session's base anchor have been applied to the host. */
@@ -145,8 +151,9 @@ export function formatHistory(v: HistoryView, now = Date.now()): string {
   for (const r of v.rows) {
     const marks = [r.isHead ? "HEAD" : "", r.applied ? "applied" : ""].filter(Boolean).join(", ");
     lines.push(`${r.isHead ? "●" : "○"} ${r.id.slice(0, 12)}  ${r.label.padEnd(18).slice(0, 18)} ${ago(r.time, now).padStart(8)}${marks ? `  (${marks})` : ""}`);
-    lines.push(r.files.length
-      ? `│   ${r.files.map((f) => `${KIND_MARK[f.kind] ?? "?"}${f.path}`).join("  ")}${r.filesMore ? "  …" : ""}`
+    const buildNote = r.build ? `${r.files.length ? "  " : ""}(+${r.build}${r.build >= 200 ? "+" : ""} build file${r.build === 1 ? "" : "s"})` : "";
+    lines.push(r.files.length || r.build
+      ? `│   ${r.files.map((f) => `${KIND_MARK[f.kind] ?? "?"}${f.path}`).join("  ")}${r.filesMore ? "  …" : ""}${buildNote}`
       : "│   (only git metadata changed)");
   }
   if (v.more) lines.push("│   … older changes not shown (/layerfs history <n>)");

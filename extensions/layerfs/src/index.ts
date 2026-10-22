@@ -188,12 +188,14 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         "action=branches: all branches of the project.",
         "action=sync: merge the project's trunk (main: what was last applied to the user's folder) into your branch.",
         "action=merge branch=<name>: merge another branch (e.g. a teammate's) into yours. On conflict nothing changes and the conflicting files are listed.",
+        "action=show branch=<name> path=<file>: print a file as it is on another branch (to resolve conflicts).",
       ].join(" "),
       parameters: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["status", "diff", "branches", "sync", "merge"] },
-          branch: { type: "string", description: "branch to merge (action=merge)" },
+          action: { type: "string", enum: ["status", "diff", "branches", "sync", "merge", "show"] },
+          branch: { type: "string", description: "branch to merge (action=merge) or read from (action=show)" },
+          path: { type: "string", description: "file path, relative to the project root (action=show)" },
         },
         required: ["action"],
         additionalProperties: false,
@@ -223,6 +225,15 @@ export default function layerfsExtension(pi: ExtensionAPI) {
           const list = await s.listAllBranches();
           return text(list.map((b) => `${b.name}${b.name === s.workBranch ? " (yours)" : ""} head ${(b.head ?? "-").slice(0, 12)}`).join("\n"));
         }
+        if (action === "show") {
+          const b = String(params?.branch ?? "").trim();
+          const rel = String(params?.path ?? "").trim().replace(/^\.?\/+/, "").replace(new RegExp(`^${s.cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/`), "");
+          if (!b || !rel) throw new Error("action=show needs branch=<name> and path=<file>");
+          if (!s.isApplicable(rel) && rel !== ".lww") throw new Error(`${rel} is not readable here (secret, git metadata or build output)`);
+          const r: any = await s.lfs.fs.read(b, `/${rel}`);
+          const body = r?.text ?? (r?.bytes ? Buffer.from(r.bytes).toString("utf8") : "");
+          return text(body.length > 50_000 ? `${body.slice(0, 50_000)}\n… (truncated)` : body);
+        }
         if (action === "sync" || action === "merge") {
           const other = action === "sync" ? "main" : String(params?.branch ?? "").trim();
           if (!other) throw new Error("action=merge needs branch=<name> (see action=branches)");
@@ -233,7 +244,11 @@ export default function layerfsExtension(pi: ExtensionAPI) {
             return text([
               `CONFLICT merging ${other}: nothing changed (you are still on ${s.workBranch}).`,
               "Conflicting files:", ...r.conflicts.map((c) => `  ${c.path}${c.kind ? ` (${c.kind})` : ""}`),
-              "Resolve: make your branch's version of these files match what the merged result should be (or ask the other branch's owner to), then merge again.",
+              "How to resolve (LayerFS merges three-way, so editing only your side keeps conflicting):",
+              `  1. On your branch, make each conflicting file equal to the other side's version (read it with action=show branch=${other} path=<file>), keeping your own version in mind;`,
+              `  2. merge ${other} again (it is now clean);`,
+              "  3. edit the files on your branch to the combined result you want.",
+              "Alternatively send the conflict back to the other branch's owner.",
             ].join("\n"));
           }
           recordMerge(s, other, r);

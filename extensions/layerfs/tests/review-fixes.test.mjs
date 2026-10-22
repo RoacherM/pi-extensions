@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { resolveConfig } from "../src/config.ts";
 import { acquireLock } from "../src/lock.ts";
 import { isExcludedPath, LayerfsSession } from "../src/workspace.ts";
+import { formatHistory, loadHistory } from "../src/history.ts";
 
 const id = Date.now().toString(36);
 const base = join(homedir(), ".cache/pi-layerfs-test", `fix-${id}`);
@@ -380,6 +381,35 @@ try {
     await lead.mutate("4", "write", () => lead.writeFile(join(cwd, "lead.txt"), "l\n"));
     assert.ok((await lead.mergeBranch(w2.workBranch)).merged);
     assert.deepEqual((await lead.apply()).applied.sort(), ["lead.txt", "w2.txt"]);
+  });
+
+  await step("bash keeps working after the Sandbox container restarts (runner reinstalled, not cached)", async () => {
+    const cwd = project();
+    const s = await open(cwd, "rr");
+    const o1 = out();
+    await s.mutate("1", "bash", () => s.exec("echo one", cwd, o1));
+    const ctrs = docker("ps", "--format", "{{.Names}}", "--filter", `name=^${config.prefix}`).stdout.split("\n").filter((n) => n && !n.endsWith("store"));
+    assert.ok(ctrs.length, "a Sandbox container exists");
+    for (const c of ctrs) docker("exec", "-u", "0", c, "sh", "-c", "rm -f /run/pi-lfs/pi-lfs-run-*.sh"); // what a restart does to /run
+    const o2 = out();
+    const r = await s.mutate("2", "bash", () => s.exec("echo two", cwd, o2));
+    assert.equal(r.value.exitCode, 0, o2.text());
+    assert.match(o2.text(), /two/);
+  });
+
+  await step("history folds branch-only build output into a count; unapplied ignores it", async () => {
+    const cwd = project();
+    const s = new LayerfsSession(cwd, `hb-${id}`, { ...config, branchOnly: ["target/"] });
+    sessions.push(s);
+    await s.open();
+    const o = out();
+    await s.mutate("1", "bash", () => s.exec("mkdir -p target/d && for i in 1 2 3; do echo $i > target/d/f$i; done && echo x > src.rs", cwd, o));
+    const v = await loadHistory(s, 5);
+    const text = formatHistory(v);
+    assert.match(text, /~?\+?src\.rs/);
+    assert.match(text, /\(\+3 build files\)/);
+    assert.doesNotMatch(text, /target\/d\/f1/);
+    assert.equal(v.unapplied.length, 1, JSON.stringify(v.unapplied));
   });
 
 } finally {

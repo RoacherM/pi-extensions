@@ -912,14 +912,14 @@ export class LayerfsSession {
     }
   }
 
-  private runnerReady = new Set<string>();
   /** Copies pi-lfs-run.sh into the Sandbox once (root-owned, 0755). */
   private runnerPath = "";
   /** Copies pi-lfs-run.sh into the Sandbox once, atomically, under a content-hashed name. */
   private async ensureRunner(container: string): Promise<string> {
     const script = await fsp.readFile(RUNNER_ON_HOST);
     const path = `/run/pi-lfs/pi-lfs-run-${sha(script).slice(0, 12)}.sh`;
-    if (this.runnerReady.has(`${container}\n${path}`)) return path;
+    // No per-session cache: the Sandbox container can be recreated or restarted (its /run is
+    // then empty), so check on every call. `[ -x ]` in an existing container costs one docker exec.
     const r = await run(
       this.config.docker,
       ["exec", "-i", "-u", "0", container, "sh", "-c", `[ -x "$1" ] && exit 0; mkdir -p /run/pi-lfs && t="$1.$$" && cat > "$t" && chmod 0755 "$t" && mv -f "$t" "$1"`, "_", path],
@@ -929,7 +929,6 @@ export class LayerfsSession {
       this.checkSandbox(container, r.stderr);
       throw new LayerfsError("Failed", `cannot install the command runner in ${container}: ${r.stderr.trim().slice(0, 200)}`);
     }
-    this.runnerReady.add(`${container}\n${path}`);
     return path;
   }
 
