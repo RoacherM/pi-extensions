@@ -297,6 +297,32 @@ try {
     assert.equal(await s.exists(join(cwd, "server.crt")), false);
     await assert.rejects(s.lfs.fs.stat("main", "/server.pem"), (e) => e.code === "NoSuchPath");
   });
+  await step("merge: a lead session merges sub-agent branches and applies them; /tmp alias is one project", async () => {
+    const cwd = project();
+    const alias = cwd.replace(/^\/Users\//, "/Users/"); // same path; realpath check below uses a symlink
+    const link = `${cwd}-link`;
+    (await import("node:fs")).symlinkSync(cwd, link);
+    const lead = await open(link, "ml"); // opened through a symlink
+    const w1 = await open(cwd, "mw1");
+    const w2 = await open(cwd, "mw2");
+    assert.equal(lead.project, w1.project, "symlinked path and real path are one project");
+    await w1.mutate("1", "write", () => w1.writeFile(join(cwd, "w1.txt"), "one\n"));
+    await w2.mutate("2", "write", () => w2.writeFile(join(cwd, "w2.txt"), "two\n"));
+    const m1 = await lead.mergeBranch(w1.workBranch);
+    const m2 = await lead.mergeBranch(w2.workBranch);
+    assert.ok(m1.merged && m2.merged);
+    const r = await lead.apply();
+    assert.deepEqual(r.applied.sort(), ["w1.txt", "w2.txt"]);
+    // conflict: both edit the same line
+    await w1.mutate("3", "write", () => w1.writeFile(join(cwd, "a.txt"), "from w1\n"));
+    await w2.mutate("4", "write", () => w2.writeFile(join(cwd, "a.txt"), "from w2\n"));
+    assert.ok((await lead.mergeBranch(w1.workBranch)).merged);
+    const c = await lead.mergeBranch(w2.workBranch);
+    assert.equal(c.merged, false);
+    assert.deepEqual(c.conflicts.map((x) => x.path), ["a.txt"]);
+    void alias;
+  });
+
 } finally {
   for (const s of sessions) await s.close().catch(() => {});
   const left = docker("ps", "-aq", "--filter", `name=^${config.prefix}`).stdout.trim().split("\n").filter(Boolean);

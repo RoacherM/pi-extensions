@@ -81,7 +81,8 @@ export class LayerfsSession {
   private closed = false;
 
   constructor(cwd: string, sessionId: string, config: LayerfsConfig, log: Log = () => {}) {
-    this.cwd = resolve(cwd);
+    // canonical path: /tmp/x and /private/tmp/x (or a symlinked folder) are one project
+    this.cwd = (() => { try { return realpathSync(resolve(cwd)); } catch { return resolve(cwd); } })();
     this.sessionId = sessionId;
     this.shortId = createHash("sha256").update(`${sessionId}:${randomBytes(8).toString("hex")}`).digest("hex").slice(0, 10);
     this.config = config;
@@ -357,6 +358,38 @@ export class LayerfsSession {
       this.unapplied = (await this.diff()).filter((i) => i.type !== "dir").length > 0;
       this.persistSessionBinding();
       return { branch: this.workBranch, ref: this.effectiveRef };
+    });
+    this.mutex = job.catch(() => {});
+    return job;
+  }
+
+  /**
+   * Merges another Branch of this project (e.g. a sub-agent's work branch) into this session's
+   * work branch: LayerFS branch.merge(work, other, newName), then the session moves to the result.
+   * On Conflict nothing changes and the conflict list is returned.
+   */
+  async mergeBranch(other: string): Promise<{ merged: boolean; branch: string; head: string | null; conflicts: Array<{ path: string; kind?: string }>; lww: number }> {
+    const job = this.mutex.then(async () => {
+      if (this.blocked) throw new Error(`cannot merge while a checkpoint is pending (${this.blocked.reason}); run /layerfs retry`);
+      const known = (await this.listAllBranches()).find((b) => b.name === other);
+      if (!known) throw new LayerfsError("NoSuchBranch", `no LayerFS branch named ${other} (see /layerfs branches)`);
+      this.seq++;
+      const target = `s-${this.shortId}-${this.seq}`;
+      try {
+        const m = await this.lfs.branch.merge(this.workBranch, other, target, `merge ${other} into ${this.workBranch}`);
+        this.workBranch = target;
+        this.headCommit = m.head ?? this.headCommit;
+        this.unapplied = (await this.diff()).filter((i) => i.type !== "dir").length > 0;
+        this.persistSessionBinding();
+        if (m.head) this.checkpoints.push({ origins: [`merge:${other}`], label: "merge", commit: m.head, branch: target, changed: true, at: Date.now() });
+        return { merged: true, branch: target, head: m.head ?? null, conflicts: [], lww: (m.lww ?? []).length };
+      } catch (e: any) {
+        if (e?.code === "Conflict") {
+          const conflicts = (e.detail?.conflicts ?? []).map((c: any) => ({ path: String(c.path).replace(/^\/+/, ""), kind: c.kind }));
+          return { merged: false, branch: this.workBranch, head: this.headCommit, conflicts, lww: 0 };
+        }
+        throw e;
+      }
     });
     this.mutex = job.catch(() => {});
     return job;

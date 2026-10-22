@@ -88,6 +88,7 @@ The status line shows `LFS <branch>` and `· N unapplied` once there are changes
 | `/layerfs apply` | write changes to your folder (confirm dialog). `--revert` allows going back after `/tree` |
 | `/layerfs sync [--full]` | pull your own edits made outside Pi into LayerFS |
 | `/layerfs branches` | all LayerFS branches of the project |
+| `/layerfs merge <branch>` | merge another session's branch (e.g. a sub-agent's) into this one; on conflict nothing changes and the files are listed |
 | `/layerfs retry` | retry after a failed checkpoint blocked changes |
 
 Typical flow: ask the agent to change things → `/layerfs diff` → `/layerfs apply` → commit with git.
@@ -109,8 +110,10 @@ Typical flow: ask the agent to change things → `/layerfs diff` → `/layerfs a
 
 ## 5. What it does not cover
 
-- Tools from other extensions and MCP servers, hooks, and sub-agents run by other extensions
-  (including Epi's `task`) act on your real folder.
+- Tools from other extensions and MCP servers, and hooks, act on your real folder.
+- Sub-agents: pi-subagents **background** children (`async: true`) load the parent's extensions,
+  so each gets its own LayerFS branch; merge them with `/layerfs merge`. Foreground children and
+  Epi's `task` workers do not load extensions and act on your real folder.
 - Background processes do not survive across bash calls: start and use a server in one call.
 - Commands run in Linux; native modules built for macOS in your `node_modules` will not load.
 - LayerFS keeps history without crash durability (its own "Disposable" profile): treat it as a

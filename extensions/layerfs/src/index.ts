@@ -299,10 +299,11 @@ export default function layerfsExtension(pi: ExtensionAPI) {
     ["apply", "把改动写回你的项目目录（有冲突则一个都不写；--revert 允许回退已写回的内容）"],
     ["sync", "把你在 Pi 外的改动同步进 LayerFS main（--full 全量重新校验）"],
     ["branches", "列出项目里所有 LayerFS 分支"],
+    ["merge", "把另一个分支（如子 agent 的分支）合并进本会话：merge <branch>"],
     ["retry", "checkpoint 失败被锁住后重试"],
   ];
   pi.registerCommand("layerfs", {
-    description: "LayerFS workspace: status | diff | history | apply | retry | sync | branches",
+    description: "LayerFS workspace: status | diff | history | apply | merge | retry | sync | branches",
     // Pi's editor treats Enter on an open argument menu as "apply completion" (not submit),
     // because the argument prefix does not start with "/". So once the typed argument is
     // already a complete subcommand, show no menu and let Enter submit directly.
@@ -335,6 +336,16 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       if (sub === "branches") {
         const list = await s.listAllBranches();
         return say(list.map((b) => `${b.name.padEnd(20)} head ${(b.head ?? "-").slice(0, 12)} base ${(b.base ?? "-").slice(0, 12)}`).join("\n"));
+      }
+      if (sub === "merge") {
+        const other = argv[1];
+        if (!other) return say("用法：/layerfs merge <branch>（分支名见 /layerfs branches）", "warning");
+        const r = await s.mergeBranch(other);
+        status(ctx, describe(s));
+        if (!r.merged) return say([`Conflict merging ${other}; nothing changed. Conflicting files:`, ...r.conflicts.map((c) => `  ${c.path}${c.kind ? ` (${c.kind})` : ""}`)].join("\n"), "error");
+        if (r.head) pi.appendEntry(CHECKPOINT_ENTRY, { origins: [`merge:${other}`], label: "merge", commit: r.head, branch: r.branch, changed: true, at: Date.now(), project: s.project });
+        pi.appendEntry(SESSION_ENTRY, { project: s.project, volume: s.volume, cwd: s.cwd, baseBranch: s.baseBranch, workBranch: s.workBranch, baseRef: s.baseRef, headCommit: s.headCommit });
+        return say(`Merged ${other} into this session (now on ${r.branch}${r.lww ? `, ${r.lww} generated file(s) took the newer side` : ""}). /layerfs diff to review, /layerfs apply to write to your folder.`);
       }
       if (sub === "diff") {
         const d = (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path));
