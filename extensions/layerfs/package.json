@@ -1,0 +1,53 @@
+{
+  "name": "@roacherm/pi-layerfs",
+  "version": "0.2.0",
+  "description": "Pi extension: run file tools and shell commands in an isolated LayerFS branch; your folder changes only on /layerfs apply. Optional, needs Docker.",
+  "type": "module",
+  "license": "MIT",
+  "author": "RoacherM",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RoacherM/pi-extensions.git",
+    "directory": "extensions/layerfs"
+  },
+  "homepage": "https://github.com/RoacherM/pi-extensions/tree/main/extensions/layerfs#readme",
+  "bugs": "https://github.com/RoacherM/pi-extensions/issues",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "layerfs",
+    "sandbox",
+    "isolation",
+    "coding-agent"
+  ],
+  "engines": {
+    "node": ">=22.19"
+  },
+  "files": [
+    "src/",
+    "scripts/setup-layerfs.sh",
+    "docs/EPI-INTEGRATION.md",
+    "docs/DESIGN-v0.2.md",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "test": "node tests/backend.test.mjs && node tests/review-fixes.test.mjs && node tests/pi.test.mjs && node tests/cli.test.mjs && node tests/rpc.test.mjs && node tests/scale.test.mjs",
+    "test:backend": "node tests/backend.test.mjs",
+    "test:fixes": "node tests/review-fixes.test.mjs",
+    "test:pi": "node tests/pi.test.mjs",
+    "test:cli": "node tests/cli.test.mjs",
+    "test:rpc": "node tests/rpc.test.mjs",
+    "test:scale": "node tests/scale.test.mjs",
+    "probe:real": "node probes/real/run.mjs"
+  }
+}
