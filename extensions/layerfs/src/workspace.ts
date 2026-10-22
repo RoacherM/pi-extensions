@@ -1292,11 +1292,30 @@ export class LayerfsSession {
         if (!page.hasMore || !(page.items ?? []).length) break;
         pos = page.nextPagePos ?? (pos + page.items.length);
       }
-      // base Commit not in the snapshot's history -> going back; base Layer and all Commits on it -> ok
-      return !baseIsCommit;
+      if (!baseIsCommit) return true; // base Layer and all Commits on it -> ok
+      // The base Commit is not in the snapshot's first-parent history. That happens after
+      // `/tree` (going back) but also in team flows: merging a branch forked from a later main
+      // (which contains the applied snapshot as a published Layer) fast-forwards to it.
+      // Decide by content: merging the base into the snapshot must change nothing.
+      return await this.mergeAddsNothing(snapBranch, this.baseBranch);
     } catch {
       return false;
     }
+  }
+
+  /** True if merging `other` into `branch` would leave `branch`'s tree unchanged (it already contains `other`). */
+  private async mergeAddsNothing(branch: string, other: string): Promise<boolean> {
+    const probe = `c-${this.shortId}-${(++this.seq)}`;
+    let m: any;
+    try {
+      m = await this.lfs.branch.merge(branch, other, probe, "containment probe");
+    } catch {
+      return false; // Conflict / NoMergeBase: the base has changes the snapshot lacks
+    }
+    const d = await this.lfs.branch.diff_branches(branch, probe, 1, 0, { hunks: false });
+    const same = Boolean(d.from?.root) && d.from?.root === d.to?.root;
+    if (same) return true;
+    return !(d.items ?? []).length && !d.hasMore;
   }
 
   private baseCommitKnown: Map<string, boolean> = new Map();

@@ -363,6 +363,25 @@ try {
     assert.ok(m.merged, `merge with both target/ edits: ${JSON.stringify(m.conflicts)}`);
   });
 
+  await step("team round: lead applies, worker forks the new main, lead merges it and applies again (no false WouldRevert)", async () => {
+    const cwd = project();
+    const lead = await open(cwd, "tr-lead");
+    await lead.mutate("1", "write", () => lead.writeFile(join(cwd, "skel.txt"), "skel\n"));
+    assert.deepEqual((await lead.apply()).applied, ["skel.txt"]);
+    const w = await open(cwd, "tr-w"); // forks main after the apply
+    await w.mutate("2", "write", () => w.writeFile(join(cwd, "w.txt"), "w\n"));
+    const m = await lead.mergeBranch(w.workBranch);
+    assert.ok(m.merged, JSON.stringify(m.conflicts));
+    const r = await lead.apply();
+    assert.deepEqual(r.applied, ["w.txt"]);
+    // second round
+    const w2 = await open(cwd, "tr-w2");
+    await w2.mutate("3", "write", () => w2.writeFile(join(cwd, "w2.txt"), "w2\n"));
+    await lead.mutate("4", "write", () => lead.writeFile(join(cwd, "lead.txt"), "l\n"));
+    assert.ok((await lead.mergeBranch(w2.workBranch)).merged);
+    assert.deepEqual((await lead.apply()).applied.sort(), ["lead.txt", "w2.txt"]);
+  });
+
 } finally {
   for (const s of sessions) await s.close().catch(() => {});
   const left = docker("ps", "-aq", "--filter", `name=^${config.prefix}`).stdout.trim().split("\n").filter(Boolean);
