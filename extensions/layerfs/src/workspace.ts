@@ -504,7 +504,7 @@ export class LayerfsSession {
       baseRefToPin = strippedForkedFrom;
     }
     if (!baseRefToPin) {
-      baseRefToPin = cleanRef(otherSession?.baseRef) ?? cleanRef(otherBranch?.base) ?? cleanRef(this.baseRef);
+      baseRefToPin = cleanRef(otherBranch?.base) ?? cleanRef(otherSession?.baseRef) ?? cleanRef(this.baseRef);
     }
 
     this.seq++;
