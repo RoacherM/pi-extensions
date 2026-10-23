@@ -222,7 +222,16 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         if (action === "diff") {
           if (params?.branch) {
             const resolvedBranch = await s.resolveBranchName(params.branch);
-            const resolvedBase = params?.base ? await s.resolveBranchName(params.base) : s.baseBranch;
+            let resolvedBase = s.baseBranch;
+            if (params?.base) {
+              resolvedBase = await s.resolveBranchName(params.base);
+            } else if (resolvedBranch !== "main") {
+              const bInfo = (await s.listAllBranches()).find((b) => b.name === resolvedBranch);
+              if (bInfo?.base) {
+                resolvedBase = `h-${bInfo.base.slice(0, 20)}`;
+                await s.lfs.branch.fork(resolvedBase, bInfo.base).catch(() => {});
+              }
+            }
             const all: Array<{ path: string; kind: string; type: string }> = [];
             for (let pos = 0; ; ) {
               const page = await s.lfs.branch.diff_branches(resolvedBase, resolvedBranch, 1000, pos, { hunks: false });
@@ -651,7 +660,16 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       if (sub === "diff") {
         if (argv[1]) {
           const targetBranch = await s.resolveBranchName(argv[1]);
-          const baseBranch = argv[2] ? await s.resolveBranchName(argv[2]) : s.baseBranch;
+          let baseBranch = s.baseBranch;
+          if (argv[2]) {
+            baseBranch = await s.resolveBranchName(argv[2]);
+          } else if (targetBranch !== "main") {
+            const bInfo = (await s.listAllBranches()).find((b) => b.name === targetBranch);
+            if (bInfo?.base) {
+              baseBranch = `h-${bInfo.base.slice(0, 20)}`;
+              await s.lfs.branch.fork(baseBranch, bInfo.base).catch(() => {});
+            }
+          }
           const all: Array<{ path: string; kind: string; type: string }> = [];
           for (let pos = 0; ; ) {
             const page = await s.lfs.branch.diff_branches(baseBranch, targetBranch, 1000, pos, { hunks: false });
