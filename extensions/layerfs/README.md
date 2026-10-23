@@ -133,20 +133,25 @@ Typical flow: ask the agent to change things → `/layerfs diff` → `/layerfs a
 | `PI_LAYERFS_EXCLUDES` | comma-separated gitignore-style patterns (default list in §4) |
 | `PI_LAYERFS_ENV_ALLOW` | extra env vars passed into commands besides `PI_*` |
 | `PI_LAYERFS_KILL_GRACE_MS` | `2000`: TERM → KILL grace on cancel |
-| `PI_LAYERFS_BRANCH_ONLY` | none. Comma-separated patterns (e.g. `target/,.cargo-home/`) that live only in branches and `main`: never imported, synced or applied, newer side wins on merge. For build output and caches. |
+| `PI_LAYERFS_BRANCH_ONLY` | none. Comma-separated patterns (e.g. `target/,.cargo-home/`) that live only in branches and `main`: never imported, synced or applied, newer side wins on merge (merged source files are touched before the next `bash` run so build tools rebuild). |
 | `PI_LAYERFS_TEAM` | off. `1` turns on team mode (below). |
+| `PI_LAYERFS_BRANCH_NAME` | optional logical branch alias for this session (defaults to `lead` for the top-level team session, or `s-<shortId>`). |
 
 ### Team mode (multi-agent)
 
-With `PI_LAYERFS_TEAM=1` the agent gets a `layerfs` tool (`status`, `diff`, `branches`,
-`sync` = merge `main` in, `merge <branch>`). The top-level session also gets
-`layerfs_apply`, which writes its branch to your folder and advances `main`.
-pi-subagents children (`PI_SUBAGENT_CHILD=1`) never get `layerfs_apply`.
+With `PI_LAYERFS_TEAM=1` the agent gets a `layerfs` tool (`status`, `diff [branch]`,
+`branches`, `ls [branch] [path]`, `show branch path [offset] [limit]`,
+`checkout branch path|paths`, `sync [branch] [strategy]`, `merge branch [strategy]`).
+The top-level session also gets `layerfs_apply`, which writes its branch to your folder
+and advances `main`. pi-subagents children (`PI_SUBAGENT_CHILD=1`) never get `layerfs_apply`.
 
 Typical round: the lead starts workers with `subagent({ async: true })`. Each worker
-gets its own branch, forked from `main`, and reports `BRANCH: <name>` from
-`layerfs status`. The lead merges each branch, runs the checks, and calls
-`layerfs_apply`. The next workers start from the new `main`.
+gets its own branch, forked from `main`, with a stable alias (`s-<shortId>` or
+`PI_LAYERFS_BRANCH_NAME`) that continues to resolve even after merges rotate the
+underlying branch name. The lead inspects or merges each branch (automatically falling
+back to a path-wise 3-way merge if native serial merge encounters an `InvalidRecord`),
+runs the checks, and calls `layerfs_apply`. Workers can also sync directly from `lead`
+via `layerfs(action="sync", branch="lead")` before `lead` applies to disk.
 
 Workers must be background children: foreground children don't load extensions, so
 they'd act on your folder.

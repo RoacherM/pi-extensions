@@ -2,13 +2,14 @@
 // Run: node tests/review-fixes.test.mjs
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, promises as fsp, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, promises as fsp, readFileSync, readdirSync, readlinkSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { resolveConfig } from "../src/config.ts";
 import { acquireLock } from "../src/lock.ts";
 import { isExcludedPath, LayerfsSession } from "../src/workspace.ts";
 import { formatHistory, loadHistory } from "../src/history.ts";
+import layerfsExtension from "../src/index.ts";
 
 const id = Date.now().toString(36);
 const base = join(homedir(), ".cache/pi-layerfs-test", `fix-${id}`);
@@ -410,6 +411,283 @@ try {
     assert.match(text, /\(\+3 build files\)/);
     assert.doesNotMatch(text, /target\/d\/f1/);
     assert.equal(v.unapplied.length, 1, JSON.stringify(v.unapplied));
+  });
+
+  await step("fallback merge on InvalidRecord and after rm/mv in bash", async () => {
+    const cwd = project();
+    const lead = await open(cwd, "fbm-lead");
+    const worker = await open(cwd, "fbm-w");
+    // Part A: Injected InvalidRecord
+    await lead.mutate("1", "write", () => lead.writeFile(join(cwd, "lead.txt"), "lead\n"));
+    await worker.mutate("2", "write", () => worker.writeFile(join(cwd, "worker.txt"), "worker\n"));
+
+    const realMerge = lead.lfs.branch.merge.bind(lead.lfs.branch);
+    lead.lfs.branch.merge = async () => {
+      throw Object.assign(new Error("invalid record: binding kind"), { code: "InvalidRecord" });
+    };
+    try {
+      const r = await lead.mergeBranch(worker.workBranch);
+      assert.equal(r.merged, true);
+      assert.equal(r.fallback, true);
+      assert.equal((await lead.readFile(join(cwd, "worker.txt"))).toString(), "worker\n");
+      assert.equal((await lead.readFile(join(cwd, "lead.txt"))).toString(), "lead\n");
+    } finally {
+      lead.lfs.branch.merge = realMerge;
+    }
+
+    // Part B: Real rm/mv/script writes in bash
+    await worker.mutate("3", "bash", () => worker.exec("rm a.txt && mv src/app.js src/app-renamed.js && echo 'from script' > script.txt", cwd, { onData: () => {} }));
+    const r2 = await lead.mergeBranch(worker.workBranch);
+    assert.equal(r2.merged, true);
+    assert.equal(await lead.exists(join(cwd, "a.txt")), false);
+    assert.equal(await lead.exists(join(cwd, "src/app.js")), false);
+    assert.equal(await lead.exists(join(cwd, "src/app-renamed.js")), true);
+    assert.equal((await lead.readFile(join(cwd, "script.txt"))).toString(), "from script\n");
+  });
+
+  await step("conflict resolution via strategy theirs and strategy ours", async () => {
+    const cwd = project();
+    const lead = await open(cwd, "str-lead");
+    const worker = await open(cwd, "str-w");
+    await lead.mutate("1", "write", () => lead.writeFile(join(cwd, "conf.txt"), "ours initial\n"));
+    await worker.mutate("2", "write", () => worker.writeFile(join(cwd, "conf.txt"), "theirs v1\n"));
+
+    const c = await lead.mergeBranch(worker.workBranch);
+    assert.equal(c.merged, false);
+    assert.deepEqual(c.conflicts.map((x) => x.path), ["conf.txt"]);
+
+    const rTheirs = await lead.mergeBranch(worker.workBranch, { strategy: "theirs" });
+    assert.equal(rTheirs.merged, true);
+    assert.equal((await lead.readFile(join(cwd, "conf.txt"))).toString(), "theirs v1\n");
+
+    await worker.mutate("3", "write", () => worker.writeFile(join(cwd, "conf.txt"), "theirs v2\n"));
+    const rOurs = await lead.mergeBranch(worker.workBranch, { strategy: "ours" });
+    assert.equal(rOurs.merged, true);
+    assert.equal((await lead.readFile(join(cwd, "conf.txt"))).toString(), "theirs v1\n");
+  });
+
+  await step("layerfs show >60KB without truncation, pagination, ls, checkout, and cross-branch diff", async () => {
+    const cwd = project();
+    process.env.PI_LAYERFS_TEAM = "1";
+    process.env.PI_LAYERFS_ROOT = config.root;
+    process.env.PI_LAYERFS_PREFIX = config.prefix;
+
+    let layerfsTool;
+    let sessionStartHandler;
+    let sessionShutdownHandler;
+    const fakePi = {
+      registerFlag: () => {},
+      registerTool: (t) => { if (t.name === "layerfs") layerfsTool = t; },
+      registerCommand: () => {},
+      on: (evt, fn) => {
+        if (evt === "session_start") sessionStartHandler = fn;
+        if (evt === "session_shutdown") sessionShutdownHandler = fn;
+      },
+      appendEntry: () => {},
+      events: { emit: () => {} },
+      getFlag: () => false,
+    };
+    layerfsExtension(fakePi);
+    assert.ok(layerfsTool, "layerfs tool registered");
+
+    const fakeCtx = {
+      cwd,
+      sessionManager: { getSessionId: () => `lead-${id}`, getBranch: () => [] },
+      ui: { setStatus: () => {}, notify: () => {} },
+    };
+    await sessionStartHandler({ reason: "startup" }, fakeCtx);
+
+    const worker = new LayerfsSession(cwd, `show-w-${id}`, { ...config, branchName: "worker-feat" });
+    sessions.push(worker);
+    await worker.open();
+
+    // Create >60KB file (1200 lines, ~70KB) on worker branch
+    const bigContent = Array.from({ length: 1200 }, (_, i) => `line ${i + 1}: ${"x".repeat(50)}\n`).join("");
+    assert.ok(bigContent.length > 60000);
+    await worker.mutate("1", "write", () => worker.writeFile(join(cwd, "big.txt"), bigContent));
+
+    // 1. show >60KB file without 49KB truncation
+    const showRes = await layerfsTool.execute("c1", { action: "show", branch: "worker-feat", path: "big.txt" }, null, null, fakeCtx);
+    assert.equal(showRes.content[0].text, bigContent);
+
+    // 2. show with offset and limit pagination
+    const pageRes = await layerfsTool.execute("c2", { action: "show", branch: "worker-feat", path: "big.txt", offset: 10, limit: 5 }, null, null, fakeCtx);
+    assert.ok(pageRes.content[0].text.includes("showing lines 10-14 of 1200"));
+    assert.ok(pageRes.content[0].text.includes("pass offset=15 to read more"));
+
+    // 3. show on a directory
+    const dirRes = await layerfsTool.execute("c3", { action: "show", branch: "worker-feat", path: "src" }, null, null, fakeCtx);
+    assert.equal(dirRes.content[0].text.trim(), "app.js");
+
+    // 4. action=ls
+    const lsRes = await layerfsTool.execute("c4", { action: "ls", branch: "worker-feat", path: "/" }, null, null, fakeCtx);
+    assert.ok(lsRes.content[0].text.includes("src/"));
+    assert.ok(lsRes.content[0].text.includes("big.txt"));
+
+    // 5. action=checkout
+    const coRes = await layerfsTool.execute("c5", { action: "checkout", branch: "worker-feat", path: "big.txt" }, null, null, fakeCtx);
+    assert.ok(coRes.content[0].text.includes("Checked out 1 file(s)"));
+    const leadCheck = await layerfsTool.execute("c5b", { action: "show", branch: "lead", path: "big.txt" }, null, null, fakeCtx);
+    assert.equal(leadCheck.content[0].text, bigContent);
+
+    // 6. cross-branch diff
+    await worker.mutate("2", "write", () => worker.writeFile(join(cwd, "diff-check.txt"), "diff\n"));
+    const diffRes = await layerfsTool.execute("c6", { action: "diff", branch: "worker-feat", base: "main" }, null, null, fakeCtx);
+    assert.ok(diffRes.content[0].text.includes("diff-check.txt"));
+    assert.ok(diffRes.content[0].text.includes("big.txt"));
+
+    // 7. sync from worker branch
+    const syncRes = await layerfsTool.execute("c7", { action: "sync", branch: "worker-feat" }, null, null, fakeCtx);
+    assert.ok(syncRes.content[0].text.includes("Merged"));
+    const leadCheckSync = await layerfsTool.execute("c7b", { action: "show", branch: "lead", path: "diff-check.txt" }, null, null, fakeCtx);
+    assert.equal(leadCheckSync.content[0].text, "diff\n");
+
+    await sessionShutdownHandler?.({}, fakeCtx);
+  });
+
+  await step("stable branch name resolution and filtered listUserBranches", async () => {
+    const cwd = project();
+    const lead = new LayerfsSession(cwd, `res-lead-${id}`, { ...config, team: true });
+    sessions.push(lead);
+    await lead.open();
+    const worker = new LayerfsSession(cwd, `res-w-${id}`, { ...config, team: true, branchName: "worker-sub" });
+    sessions.push(worker);
+    await worker.open();
+
+    const initialWorkBranch = worker.workBranch;
+    assert.match(initialWorkBranch, /-1$/);
+
+    // Rotate worker branch via merges/checkpoints
+    await worker.mutate("1", "write", () => worker.writeFile(join(cwd, "f1.txt"), "1\n"));
+    const sy1 = await worker.mergeBranch("main");
+    assert.ok(sy1.merged);
+    assert.match(worker.workBranch, /-2$/);
+
+    await worker.mutate("2", "write", () => worker.writeFile(join(cwd, "f2.txt"), "2\n"));
+    const sy2 = await worker.mergeBranch("main");
+    assert.ok(sy2.merged);
+    assert.match(worker.workBranch, /-3$/);
+
+    // Resolve by logicalBranch alias
+    assert.equal(await lead.resolveBranchName("worker-sub"), worker.workBranch);
+    assert.equal(await lead.resolveBranchName("lead"), lead.workBranch);
+    assert.equal(await lead.resolveBranchName("main"), "main");
+
+    // Resolve by stale/old workBranch name
+    assert.equal(await lead.resolveBranchName(initialWorkBranch), worker.workBranch);
+
+    // Resolve by shortId
+    assert.equal(await lead.resolveBranchName(worker.shortId), worker.workBranch);
+    assert.equal(await lead.resolveBranchName(`s-${worker.shortId}`), worker.workBranch);
+
+    // listUserBranches
+    const uBranches = await lead.listUserBranches();
+    const names = uBranches.map((b) => b.name);
+    assert.ok(names.includes(worker.workBranch));
+    assert.ok(!names.includes(initialWorkBranch));
+    for (const b of uBranches) {
+      assert.ok(!/^(?:[abcrhm]|sync)-/.test(b.name), `unexpected internal branch: ${b.name}`);
+    }
+  });
+
+  await step("touching merged source files on next exec when target/ is branchOnly", async () => {
+    const cwd = project();
+    const bcfg = { ...config, branchOnly: ["target/"], team: true };
+    const lead = new LayerfsSession(cwd, `tch-lead-${id}`, bcfg);
+    sessions.push(lead);
+    await lead.open();
+    const worker = new LayerfsSession(cwd, `tch-w-${id}`, { ...bcfg, branchName: "compiler" });
+    sessions.push(worker);
+    await worker.open();
+
+    // Worker creates build artifact and source
+    await worker.mutate("1", "bash", () => worker.exec("mkdir -p target/debug && echo bin-v1 > target/debug/app && echo 'fn main() { 1 }' > main.rs", cwd, { onData: () => {} }));
+
+    await new Promise((r) => setTimeout(r, 1100));
+
+    // Lead merges worker
+    const m = await lead.mergeBranch(worker.workBranch);
+    assert.ok(m.merged);
+    assert.ok(lead.touchPathsOnNextExec.has("main.rs"), "touchPathsOnNextExec contains main.rs");
+
+    // Lead runs exec
+    const chunks = [];
+    await lead.mutate("2", "bash", () => lead.exec("stat -c %Y main.rs && stat -c %Y target/debug/app", cwd, { onData: (d) => chunks.push(d.toString()) }));
+    const [srcMtime, appMtime] = chunks.join("").trim().split(/\s+/).map(Number);
+    assert.ok(srcMtime >= appMtime, `main.rs (${srcMtime}) must be >= target/debug/app (${appMtime})`);
+  });
+
+  await step("fallbackMergeBranch with forkedFrom commit:..., +x mode and symlink, then lead.apply() without WouldRevert", async () => {
+    const cwd = project();
+    const lead = await open(cwd, "fbm-sym-lead");
+    const worker = await open(cwd, "fbm-sym-w");
+
+    // Lead writes an initial file and applies it, so lead.baseRef becomes a commit
+    await lead.mutate("1", "write", () => lead.writeFile(join(cwd, "lead-init.txt"), "lead initial\n"));
+    const applyInit = await lead.apply();
+    assert.ok(applyInit.applied.includes("lead-init.txt"));
+    assert.ok(lead.baseRef, "lead has a baseRef");
+
+    // Worker creates an executable script and a symlink
+    await worker.mutate("2", "bash", () =>
+      worker.exec("echo '#!/bin/sh\necho test' > test.sh && chmod +x test.sh && ln -s test.sh link-test.sh", cwd, { onData: () => {} })
+    );
+
+    // Also worker modifies run.sh mode to +x without changing its content (content identical to base, mode changed)
+    await worker.mutate("3", "bash", () =>
+      worker.exec("chmod +x run.sh", cwd, { onData: () => {} })
+    );
+
+    // Simulate other having forkedFrom: "commit:<hex>" in list_branches (P0-1)
+    const realListBranches = lead.lfs.project.list_branches.bind(lead.lfs.project);
+    lead.lfs.project.list_branches = async (...args) => {
+      const res = await realListBranches(...args);
+      if (res?.items) {
+        for (const item of res.items) {
+          if (item.name === worker.workBranch && item.head) {
+            item.forkedFrom = `commit:${item.head}`;
+          }
+        }
+      }
+      return res;
+    };
+
+    // Simulate InvalidRecord on native merge to trigger fallbackMergeBranch
+    const realMerge = lead.lfs.branch.merge.bind(lead.lfs.branch);
+    lead.lfs.branch.merge = async (...args) => {
+      throw Object.assign(new Error("invalid record: binding kind"), { code: "InvalidRecord" });
+    };
+
+    try {
+      const r = await lead.mergeBranch(worker.workBranch);
+      assert.equal(r.merged, true, "merge succeeded");
+      assert.equal(r.fallback, true, "fallback merge was used");
+
+      // Verify test.sh exists and is executable on lead
+      const rExec = await lead.sh("stat -c %a test.sh && stat -c %a run.sh && readlink link-test.sh");
+      assert.equal(rExec.code, 0);
+      const lines = rExec.stdout.trim().split("\n");
+      assert.ok(parseInt(lines[0], 8) & 0o111, "test.sh is executable");
+      assert.ok(parseInt(lines[1], 8) & 0o111, "run.sh is executable");
+      assert.equal(lines[2], "test.sh", "link-test.sh points to test.sh");
+
+      // Verify lead.apply() succeeds without WouldRevert
+      const applyRes = await lead.apply();
+      assert.ok(applyRes.applied.includes("test.sh"), "applied test.sh");
+      assert.ok(applyRes.applied.includes("link-test.sh"), "applied link-test.sh");
+      assert.ok(applyRes.applied.includes("run.sh"), "applied run.sh");
+
+      // Verify host state
+      const hostTestSh = statSync(join(cwd, "test.sh"));
+      assert.ok(hostTestSh.mode & 0o111, "host test.sh has +x");
+      const hostRunSh = statSync(join(cwd, "run.sh"));
+      assert.ok(hostRunSh.mode & 0o111, "host run.sh has +x");
+      assert.ok(lstatSync(join(cwd, "link-test.sh")).isSymbolicLink(), "host link-test.sh is symlink");
+      assert.equal(readlinkSync(join(cwd, "link-test.sh")), "test.sh");
+    } finally {
+      lead.lfs.project.list_branches = realListBranches;
+      lead.lfs.branch.merge = realMerge;
+    }
   });
 
 } finally {

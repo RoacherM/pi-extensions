@@ -1,7 +1,7 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { constants as fsc, promises as fsp, realpathSync } from "node:fs";
-import { homedir } from "node:os";
+import { constants as fsc, mkdtempSync, promises as fsp, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { BindingStore, type HostEntry, type HostIndex, type ProjectRecord, type SessionBinding } from "./bindings.ts";
 import type { LayerfsConfig } from "./config.ts";
@@ -11,6 +11,16 @@ import { type BoxSpec, createProjectClient, ensureStoreBox } from "./port/client
 export interface Workspace { sandbox: string; path: string; image?: string }
 export interface Checkpoint { origins: string[]; label: string; commit: string | null; branch: string; changed: boolean; at: number }
 export interface ApplyResult { applied: string[]; skipped: string[]; conflicts: string[]; unchanged: string[]; warnings: string[] }
+export interface UserBranch { name: string; base: string; head: string | null; logicalBranch: string; isYours: boolean }
+export interface MergeResult {
+  merged: boolean;
+  branch: string;
+  head: string | null;
+  conflicts: Array<{ path: string; kind?: string }>;
+  lww: number;
+  lwwPaths?: string[];
+  fallback?: boolean;
+}
 export interface OpenOptions {
   reason?: "startup" | "reload" | "new" | "resume" | "fork";
   resumeBinding?: { project?: string; baseBranch?: string; workBranch?: string; baseRef?: string; headCommit?: string | null };
@@ -53,6 +63,8 @@ export class LayerfsSession {
   readonly cwd: string;
   readonly sessionId: string;
   readonly shortId: string;
+  readonly logicalBranch: string;
+  readonly touchPathsOnNextExec = new Set<string>();
   readonly config: LayerfsConfig;
   readonly log: Log;
 
@@ -85,6 +97,7 @@ export class LayerfsSession {
     this.cwd = (() => { try { return realpathSync(resolve(cwd)); } catch { return resolve(cwd); } })();
     this.sessionId = sessionId;
     this.shortId = createHash("sha256").update(`${sessionId}:${randomBytes(8).toString("hex")}`).digest("hex").slice(0, 10);
+    this.logicalBranch = config.branchName || (config.team && process.env.PI_SUBAGENT_CHILD !== "1" ? "lead" : `s-${this.shortId}`);
     this.config = config;
     this.log = log;
   }
@@ -368,32 +381,411 @@ export class LayerfsSession {
    * Merges another Branch of this project (e.g. a sub-agent's work branch) into this session's
    * work branch: LayerFS branch.merge(work, other, newName), then the session moves to the result.
    * On Conflict nothing changes and the conflict list is returned.
+   * If native merge fails (or strategy/resolve provided), runs path-wise fallback merge.
    */
-  async mergeBranch(other: string): Promise<{ merged: boolean; branch: string; head: string | null; conflicts: Array<{ path: string; kind?: string }>; lww: number }> {
+  async mergeBranch(
+    other: string,
+    options?: { strategy?: "ours" | "theirs"; resolve?: Record<string, "ours" | "theirs"> }
+  ): Promise<MergeResult> {
     const job = this.mutex.then(async () => {
       if (this.blocked) throw new Error(`cannot merge while a checkpoint is pending (${this.blocked.reason}); run /layerfs retry`);
-      const known = (await this.listAllBranches()).find((b) => b.name === other);
+      const resolvedOther = await this.resolveBranchName(other);
+      const branches = await this.listAllBranches();
+      const known = branches.find((b) => b.name === resolvedOther);
       if (!known) throw new LayerfsError("NoSuchBranch", `no LayerFS branch named ${other} (see /layerfs branches)`);
+
+      if (options?.strategy || options?.resolve) {
+        return await this.fallbackMergeBranch(resolvedOther, options);
+      }
+
       this.seq++;
       const target = `s-${this.shortId}-${this.seq}`;
+      const priorWork = this.workBranch;
       try {
-        const m = await this.lfs.branch.merge(this.workBranch, other, target, `merge ${other} into ${this.workBranch}`);
+        const m = await this.lfs.branch.merge(this.workBranch, resolvedOther, target, `merge ${resolvedOther} into ${this.workBranch}`);
         this.workBranch = target;
         this.headCommit = m.head ?? this.headCommit;
         this.unapplied = await this.hasApplicable();
         this.persistSessionBinding();
-        if (m.head) this.checkpoints.push({ origins: [`merge:${other}`], label: "merge", commit: m.head, branch: target, changed: true, at: Date.now() });
-        return { merged: true, branch: target, head: m.head ?? null, conflicts: [], lww: (m.lww ?? []).length };
+        if (m.head) this.checkpoints.push({ origins: [`merge:${resolvedOther}`], label: "merge", commit: m.head, branch: target, changed: true, at: Date.now() });
+
+        const diffItems: any[] = [];
+        for (let pos = 0; ; ) {
+          const page = await this.lfs.branch.diff_branches(priorWork, resolvedOther, 1000, pos, { hunks: false }).catch(() => null);
+          for (const it of page?.items ?? []) diffItems.push(it);
+          if (!page?.hasMore || !(page?.items ?? []).length) break;
+          pos = page.nextPagePos ?? (pos + page.items.length);
+        }
+        for (const it of diffItems) {
+          if (it.type !== "dir" && this.isApplicable(it.path)) {
+            this.touchPathsOnNextExec.add(it.path.replace(/^\/+/, ""));
+          }
+        }
+
+        const lwwPaths: string[] = [];
+        for (const entry of (m.lww ?? [])) {
+          const p = String(entry.path ?? "").replace(/^\/+/, "");
+          if (p && !p.startsWith(".git/") && p !== ".git") {
+            lwwPaths.push(p);
+          }
+        }
+
+        return { merged: true, branch: target, head: m.head ?? null, conflicts: [], lww: (m.lww ?? []).length, lwwPaths };
       } catch (e: any) {
         if (e?.code === "Conflict") {
+          if (options?.strategy || options?.resolve) {
+            return await this.fallbackMergeBranch(resolvedOther, options);
+          }
           const conflicts = (e.detail?.conflicts ?? []).map((c: any) => ({ path: String(c.path).replace(/^\/+/, ""), kind: c.kind }));
           return { merged: false, branch: this.workBranch, head: this.headCommit, conflicts, lww: 0 };
         }
-        throw e;
+        if (e?.code === "NoSuchBranch") throw e;
+        return await this.fallbackMergeBranch(resolvedOther, options);
       }
     });
     this.mutex = job.catch(() => {});
     return job;
+  }
+
+  private async fallbackMergeBranch(
+    resolvedOther: string,
+    options?: { strategy?: "ours" | "theirs"; resolve?: Record<string, "ours" | "theirs"> }
+  ): Promise<MergeResult> {
+    const branches = await this.listAllBranches();
+    const otherBranch = branches.find((b) => b.name === resolvedOther);
+
+    const ourCommits = await this.lfs.branch.list_commits(this.workBranch, 200, 0).then((p) => p.items ?? []).catch(() => []);
+    const otherCommits = await this.lfs.branch.list_commits(resolvedOther, 200, 0).then((p) => p.items ?? []).catch(() => []);
+
+    const ourAncestors = new Set<string>();
+    const addAncestor = (r?: string | null) => {
+      const cr = cleanRef(r);
+      if (cr) ourAncestors.add(cr);
+    };
+    addAncestor(this.headCommit);
+    addAncestor(this.baseRef);
+    const ourBranch = branches.find((b) => b.name === this.workBranch);
+    addAncestor(ourBranch?.base);
+
+    for (const c of ourCommits) {
+      addAncestor(c.id);
+      addAncestor(c.parent);
+      addAncestor(c.secondParent);
+      addAncestor(c.base);
+    }
+
+    this.bindings?.reload();
+    const otherShortIdMatch = resolvedOther.match(/^s-([a-f0-9]{10})/);
+    const otherSession = Object.values(this.bindings?.data?.sessions ?? {}).find(
+      (s) => s.workBranch === resolvedOther || (otherShortIdMatch && s.workBranch?.startsWith(`s-${otherShortIdMatch[1]}-`))
+    );
+
+    let baseRefToPin: string | null = null;
+    for (const c of otherCommits) {
+      const cid = cleanRef(c.id);
+      const cparent = cleanRef(c.parent);
+      const csecondParent = cleanRef(c.secondParent);
+      if (cid && ourAncestors.has(cid)) {
+        baseRefToPin = cid;
+        break;
+      }
+      if (cparent && ourAncestors.has(cparent)) {
+        baseRefToPin = cparent;
+        break;
+      }
+      if (csecondParent && ourAncestors.has(csecondParent)) {
+        baseRefToPin = csecondParent;
+        break;
+      }
+    }
+
+    const strippedForkedFrom = cleanRef((otherBranch as any)?.forkedFrom);
+    if (!baseRefToPin && strippedForkedFrom && ourAncestors.has(strippedForkedFrom)) {
+      baseRefToPin = strippedForkedFrom;
+    }
+    if (!baseRefToPin) {
+      baseRefToPin = cleanRef(otherSession?.baseRef) ?? cleanRef(otherBranch?.base) ?? cleanRef(this.baseRef);
+    }
+
+    this.seq++;
+    const basePin = `c-${this.shortId}-${this.seq}`;
+    try {
+      await this.lfs.branch.fork(basePin, baseRefToPin!);
+    } catch (e: any) {
+      const fallbackRef = cleanRef(otherBranch?.base) ?? cleanRef(this.baseRef);
+      if (fallbackRef && fallbackRef !== baseRefToPin) {
+        await this.lfs.branch.fork(basePin, fallbackRef);
+      } else {
+        throw e;
+      }
+    }
+
+    const shouldIgnore = (sp: string) => {
+      const rel = sp.replace(/^\/+/, "");
+      if (!rel || rel === ".lww" || rel === ".git" || rel.startsWith(".git/")) return true;
+      if (isExcludedPath(rel, this.config.excludes)) return true;
+      if (this.config.branchOnly.length && isExcludedPath(rel, this.config.branchOnly)) return true;
+      return false;
+    };
+
+    const collectDiff = async (from: string, to: string) => {
+      const items: Array<{ path: string; kind: string; type: string }> = [];
+      for (let pos = 0; ; ) {
+        const page = await this.lfs.branch.diff_branches(from, to, 1000, pos, { hunks: false });
+        for (const it of page.items ?? []) items.push(it);
+        if (!page.hasMore || !(page.items ?? []).length) break;
+        pos = page.nextPagePos ?? (pos + page.items.length);
+      }
+      return items;
+    };
+
+    const theirDiff = (await collectDiff(basePin, resolvedOther)).filter((it) => it.type !== "dir" && !shouldIgnore(it.path));
+
+    const candidatePaths = new Set<string>();
+    for (const it of theirDiff) candidatePaths.add(it.path.replace(/^\/+/, ""));
+
+    const sameBytes = (a: Buffer | null, b: Buffer | null) => {
+      if (a === null && b === null) return true;
+      if (a === null || b === null) return false;
+      return Buffer.compare(a, b) === 0;
+    };
+
+    const ops: any[] = [];
+    const mountJobs: Array<{ rel: string; entry: HostEntry; bytes?: Buffer | null }> = [];
+    const createdDirs = new Set<string>();
+    const conflicts: Array<{ path: string; kind?: string }> = [];
+
+    const addDirOps = (sp: string) => {
+      const parts = sp.split("/").filter(Boolean);
+      let cur = "";
+      for (let i = 0; i < parts.length - 1; i++) {
+        cur += "/" + parts[i];
+        if (!createdDirs.has(cur)) {
+          createdDirs.add(cur);
+          ops.push({ op: "mkdir", path: cur });
+        }
+      }
+    };
+
+    for (const rel of candidatePaths) {
+      const sp = "/" + rel;
+      const otherStat = await this.lfs.fs.stat(resolvedOther, sp).catch(() => null);
+      const baseStat = await this.lfs.fs.stat(basePin, sp).catch(() => null);
+      const ourStat = await this.lfs.fs.stat(this.workBranch, sp).catch(() => null);
+
+      const isSymlink = otherStat?.type === "symlink" || baseStat?.type === "symlink" || ourStat?.type === "symlink";
+
+      if (isSymlink) {
+        const baseSig = baseStat ? await this.readSigAtBranch(basePin, rel) : null;
+        const ourSig = ourStat ? await this.readSigAtBranch(this.workBranch, rel) : null;
+        const theirSig = otherStat ? await this.readSigAtBranch(resolvedOther, rel) : null;
+
+        // 1. ours == theirs or base == theirs: keep ours
+        if (sameSig(ourSig, theirSig) || sameSig(baseSig, theirSig)) {
+          continue;
+        }
+
+        // 2. base == ours: take theirs
+        if (sameSig(baseSig, ourSig)) {
+          if (theirSig === null) {
+            ops.push({ op: "rm", path: sp });
+          } else if (theirSig.kind === "symlink") {
+            addDirOps(sp);
+            mountJobs.push({ rel, entry: theirSig });
+          } else {
+            addDirOps(sp);
+            const theirs = await readRefBytes(this, resolvedOther, sp);
+            ops.push({ op: "write", path: sp, bytes: theirs ?? Buffer.alloc(0) });
+            if (((theirSig.mode ?? 0o644) & 0o111) !== 0 || (theirSig.mode !== undefined && (theirSig.mode & 0o7777) !== 0o644)) {
+              mountJobs.push({ rel, entry: theirSig, bytes: theirs ?? Buffer.alloc(0) });
+            }
+          }
+          continue;
+        }
+
+        // 3. Both ours and theirs changed differently
+        const pref = options?.resolve?.[rel] ?? options?.strategy;
+        if (pref === "ours") {
+          continue;
+        }
+        if (pref === "theirs") {
+          if (theirSig === null) {
+            ops.push({ op: "rm", path: sp });
+          } else if (theirSig.kind === "symlink") {
+            addDirOps(sp);
+            mountJobs.push({ rel, entry: theirSig });
+          } else {
+            addDirOps(sp);
+            const theirs = await readRefBytes(this, resolvedOther, sp);
+            ops.push({ op: "write", path: sp, bytes: theirs ?? Buffer.alloc(0) });
+            if (((theirSig.mode ?? 0o644) & 0o111) !== 0 || (theirSig.mode !== undefined && (theirSig.mode & 0o7777) !== 0o644)) {
+              mountJobs.push({ rel, entry: theirSig, bytes: theirs ?? Buffer.alloc(0) });
+            }
+          }
+          continue;
+        }
+
+        conflicts.push({ path: rel, kind: "ContentConflict" });
+        continue;
+      }
+
+      // Neither side is a symlink: regular file or absent
+      const base = await readRefBytes(this, basePin, sp);
+      const ours = await readRefBytes(this, this.workBranch, sp);
+      const theirs = await readRefBytes(this, resolvedOther, sp);
+
+      // 1. sameBytes(base, theirs):
+      // Because rel was reported in theirDiff, diff_branches reported a change.
+      // If bytes are identical to base, resolvedOther changed the mode (exec bit)!
+      if (sameBytes(base, theirs)) {
+        const baseSig = base !== null ? await this.readSigAtBranch(basePin, rel) : null;
+        const theirSig = theirs !== null ? await this.readSigAtBranch(resolvedOther, rel) : null;
+        if (!sameSig(baseSig, theirSig)) {
+          const ourSig = ours !== null ? await this.readSigAtBranch(this.workBranch, rel) : null;
+          if (sameSig(baseSig, ourSig)) {
+            mountJobs.push({ rel, entry: theirSig!, bytes: theirs });
+            continue;
+          }
+          const pref = options?.resolve?.[rel] ?? options?.strategy;
+          if (pref === "ours") continue;
+          if (pref === "theirs") {
+            mountJobs.push({ rel, entry: theirSig!, bytes: theirs });
+            continue;
+          }
+          if (!sameSig(ourSig, theirSig)) {
+            conflicts.push({ path: rel, kind: "ModeConflict" });
+            continue;
+          }
+          continue;
+        }
+        continue;
+      }
+
+      // 1b. sameBytes(ours, theirs):
+      if (sameBytes(ours, theirs)) {
+        const baseSig = base !== null ? await this.readSigAtBranch(basePin, rel) : null;
+        const theirSig = theirs !== null ? await this.readSigAtBranch(resolvedOther, rel) : null;
+        if (!sameSig(baseSig, theirSig)) {
+          const ourSig = ours !== null ? await this.readSigAtBranch(this.workBranch, rel) : null;
+          if (!sameSig(ourSig, theirSig)) {
+            const pref = options?.resolve?.[rel] ?? options?.strategy;
+            if (pref === "theirs") {
+              mountJobs.push({ rel, entry: theirSig!, bytes: theirs });
+            } else if (pref !== "ours") {
+              conflicts.push({ path: rel, kind: "ModeConflict" });
+            }
+          }
+        }
+        continue;
+      }
+
+      // 2. base == ours: take theirs
+      if (sameBytes(base, ours)) {
+        if (theirs === null) {
+          ops.push({ op: "rm", path: sp });
+        } else {
+          addDirOps(sp);
+          ops.push({ op: "write", path: sp, bytes: theirs });
+          const theirSig = await this.readSigAtBranch(resolvedOther, rel);
+          if (theirSig && (((theirSig.mode ?? 0o644) & 0o111) !== 0 || (theirSig.mode !== undefined && (theirSig.mode & 0o7777) !== 0o644))) {
+            mountJobs.push({ rel, entry: theirSig, bytes: theirs });
+          }
+        }
+        continue;
+      }
+
+      // 3. Both ours and theirs changed differently from base
+      const pref = options?.resolve?.[rel] ?? options?.strategy;
+      if (pref === "ours") {
+        continue;
+      }
+      if (pref === "theirs") {
+        if (theirs === null) {
+          ops.push({ op: "rm", path: sp });
+        } else {
+          addDirOps(sp);
+          ops.push({ op: "write", path: sp, bytes: theirs });
+          const theirSig = await this.readSigAtBranch(resolvedOther, rel);
+          if (theirSig && (((theirSig.mode ?? 0o644) & 0o111) !== 0 || (theirSig.mode !== undefined && (theirSig.mode & 0o7777) !== 0o644))) {
+            mountJobs.push({ rel, entry: theirSig, bytes: theirs });
+          }
+        }
+        continue;
+      }
+
+      if (ours === null || theirs === null) {
+        conflicts.push({ path: rel, kind: ours === null ? "ModifyDelete" : "DeleteModify" });
+        continue;
+      }
+
+      if (isBinary(ours) || isBinary(theirs) || (base !== null && isBinary(base))) {
+        conflicts.push({ path: rel, kind: "BinaryConflict" });
+        continue;
+      }
+
+      const mergeRes = threeWayMerge(ours, base, theirs);
+      if ("merged" in mergeRes) {
+        addDirOps(sp);
+        ops.push({ op: "write", path: sp, bytes: mergeRes.merged });
+        const theirSig = await this.readSigAtBranch(resolvedOther, rel);
+        if (theirSig && (((theirSig.mode ?? 0o644) & 0o111) !== 0 || (theirSig.mode !== undefined && (theirSig.mode & 0o7777) !== 0o644))) {
+          mountJobs.push({ rel, entry: theirSig, bytes: mergeRes.merged });
+        }
+      } else {
+        conflicts.push({ path: rel, kind: "ContentConflict" });
+      }
+    }
+
+    if (conflicts.length > 0) {
+      return {
+        merged: false,
+        branch: this.workBranch,
+        head: this.headCommit,
+        conflicts,
+        lww: 0,
+      };
+    }
+
+    this.seq++;
+    const target = `s-${this.shortId}-${this.seq}`;
+    await this.lfs.branch.fork(target, this.workBranch);
+    if (ops.length > 0) {
+      const res = await this.lfs.fs.apply(target, ops, `merge ${resolvedOther} into ${this.workBranch} (fallback)`);
+      this.headCommit = res.commit?.id ?? res.head ?? this.headCommit;
+    }
+    if (mountJobs.length > 0) {
+      await this.withMountedBranch(target, true, `merge special files from ${resolvedOther}`, async (ctr, ident, wsPath) => {
+        for (const { rel, entry, bytes } of mountJobs) {
+          const dst = posix.join(wsPath, rel);
+          const r = entry.kind === "symlink"
+            ? await this.dexec(ctr, ident, `mkdir -p "$(dirname "$1")" && rm -rf "$1" && ln -s "$2" "$1"`, [dst, entry.sig.slice("link:".length)])
+            : await this.dexec(ctr, ident, `mkdir -p "$(dirname "$1")" && rm -f "$1" && cat > "$1" && chmod "$2" "$1"`, [dst, ((entry.mode ?? 0o644) & 0o7777).toString(8)], bytes ?? Buffer.alloc(0));
+          if (r.code !== 0) throw new LayerfsError("Failed", `merge of ${rel} failed: ${r.stderr.toString().trim().slice(0, 200)}`);
+        }
+      });
+      this.headCommit = this.lastStoreCommit?.head ?? this.headCommit;
+    }
+    this.workBranch = target;
+    this.unapplied = await this.hasApplicable();
+    this.persistSessionBinding();
+    if (this.headCommit) {
+      this.checkpoints.push({ origins: [`merge:${resolvedOther}`], label: "merge", commit: this.headCommit, branch: target, changed: ops.length > 0 || mountJobs.length > 0, at: Date.now() });
+    }
+
+    for (const it of theirDiff) {
+      if (this.isApplicable(it.path) && it.type !== "dir") {
+        this.touchPathsOnNextExec.add(it.path.replace(/^\/+/, ""));
+      }
+    }
+
+    return {
+      merged: true,
+      branch: target,
+      head: this.headCommit,
+      conflicts: [],
+      lww: 0,
+      fallback: true,
+    };
   }
 
   private persistSessionBinding(): void {
@@ -408,6 +800,7 @@ export class LayerfsSession {
       unapplied: this.unapplied,
       seq: this.seq,
       updatedAt: Date.now(),
+      logicalBranch: this.logicalBranch,
     });
   }
 
@@ -420,6 +813,148 @@ export class LayerfsSession {
       pos = page.nextPagePos ?? (pos + page.items.length);
     }
     return out;
+  }
+
+  async resolveBranchName(name: string): Promise<string> {
+    const trimmed = String(name ?? "").trim();
+    if (!trimmed || trimmed === "main") return "main";
+    this.bindings?.reload();
+
+    const sessions = Object.values(this.bindings?.data?.sessions ?? {})
+      .filter((s) => s.project === this.projectRecord?.name)
+      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+
+    // 1. Direct logicalBranch or sessionId match in active project sessions
+    for (const s of sessions) {
+      if (s.logicalBranch === trimmed || (s as any).sessionId === trimmed) {
+        return s.workBranch;
+      }
+    }
+
+    // 2. Exact workBranch match in active sessions
+    for (const s of sessions) {
+      if (s.workBranch === trimmed) {
+        return s.workBranch;
+      }
+    }
+
+    // 3. ShortId match: name is s-<shortId>, <shortId>, or s-<shortId>-<seq>
+    const sm = /^(?:s-)?([a-f0-9]{8,16})(?:-(\d+))?$/.exec(trimmed);
+    if (sm) {
+      const shortId = sm[1];
+      for (const s of sessions) {
+        if (s.workBranch?.startsWith(`s-${shortId}-`)) {
+          return s.workBranch;
+        }
+      }
+    }
+
+    // 4. Check listAllBranches
+    const branches = await this.listAllBranches();
+    if (branches.some((b) => b.name === trimmed)) {
+      if (sm) {
+        const shortId = sm[1];
+        const targetSeq = sm[2] ? parseInt(sm[2], 10) : 0;
+        let highestBranch = trimmed;
+        let highestSeq = targetSeq;
+        for (const b of branches) {
+          const bm = /^s-([a-f0-9]+)-(\d+)$/.exec(b.name);
+          if (bm && bm[1] === shortId) {
+            const seq = parseInt(bm[2], 10);
+            if (seq > highestSeq) {
+              highestSeq = seq;
+              highestBranch = b.name;
+            }
+          }
+        }
+        return highestBranch;
+      }
+      return trimmed;
+    }
+
+    // 5. If trimmed is s-<shortId> without seq, find highest seq in branches
+    if (sm && !sm[2]) {
+      const shortId = sm[1];
+      let highestBranch: string | null = null;
+      let highestSeq = -1;
+      for (const b of branches) {
+        const bm = /^s-([a-f0-9]+)-(\d+)$/.exec(b.name);
+        if (bm && bm[1] === shortId) {
+          const seq = parseInt(bm[2], 10);
+          if (seq > highestSeq) {
+            highestSeq = seq;
+            highestBranch = b.name;
+          }
+        }
+      }
+      if (highestBranch) return highestBranch;
+    }
+
+    return trimmed;
+  }
+
+  async listUserBranches(): Promise<UserBranch[]> {
+    this.bindings?.reload();
+    const all = await this.listAllBranches();
+    const isInternal = (name: string) => /^(?:[abcrhm]|sync)-/.test(name);
+    const nonInternal = all.filter((b) => !isInternal(b.name));
+
+    const sessions = Object.values(this.bindings?.data?.sessions ?? {})
+      .filter((s) => s.project === this.projectRecord?.name);
+
+    const sMap = new Map<string, { branch: (typeof all)[0]; seq: number }>();
+    const others: typeof all = [];
+
+    for (const b of nonInternal) {
+      const m = /^s-([a-f0-9]+)-(\d+)$/.exec(b.name);
+      if (m) {
+        const shortId = m[1];
+        const seq = parseInt(m[2], 10);
+        const existing = sMap.get(shortId);
+        if (!existing || seq > existing.seq) {
+          sMap.set(shortId, { branch: b, seq });
+        }
+      } else {
+        others.push(b);
+      }
+    }
+
+    const result: UserBranch[] = [];
+
+    for (const [shortId, { branch }] of sMap.entries()) {
+      const sess = sessions.find((s) => s.workBranch === branch.name || s.workBranch?.startsWith(`s-${shortId}-`));
+      let alias = sess?.logicalBranch;
+      if (!alias) {
+        alias = shortId === this.shortId ? this.logicalBranch : `s-${shortId}`;
+      }
+      result.push({
+        name: branch.name,
+        base: branch.base,
+        head: branch.head,
+        logicalBranch: alias,
+        isYours: branch.name === this.workBranch || shortId === this.shortId,
+      });
+    }
+
+    for (const b of others) {
+      const sess = sessions.find((s) => s.workBranch === b.name);
+      result.push({
+        name: b.name,
+        base: b.base,
+        head: b.head,
+        logicalBranch: sess?.logicalBranch ?? b.name,
+        isYours: b.name === this.workBranch,
+      });
+    }
+
+    result.sort((a, b) => {
+      if (a.isYours !== b.isYours) return a.isYours ? -1 : 1;
+      if (a.name === "main" && b.name !== "main") return -1;
+      if (b.name === "main" && a.name !== "main") return 1;
+      return a.logicalBranch.localeCompare(b.logicalBranch);
+    });
+
+    return result;
   }
 
   // ---------------------------------------------------------------- path mapping
@@ -845,6 +1380,14 @@ export class LayerfsSession {
     }
 
     const runner = await this.ensureRunner(container);
+    if (this.touchPathsOnNextExec.size > 0) {
+      const paths = [...this.touchPathsOnNextExec];
+      this.touchPathsOnNextExec.clear();
+      for (let i = 0; i < paths.length; i += 100) {
+        const batch = paths.slice(i, i + 100);
+        await this.dexec(container, ident, `cd "$1" && shift && touch -c -- "$@" || true`, [ws.path, ...batch]).catch(() => {});
+      }
+    }
     const child = spawn(
       this.config.docker,
       [
@@ -1282,11 +1825,14 @@ export class LayerfsSession {
   private async snapshotContainsBase(snapBranch: string): Promise<boolean> {
     try {
       const baseIsCommit = await this.baseIsCommit();
+      const cleanedBaseRef = cleanRef(this.baseRef);
       for (let pos = 0; ; ) {
         const page = await this.lfs.branch.list_commits(snapBranch, 500, pos);
         for (const c of page.items ?? []) {
-          if (baseIsCommit && c.id === this.baseRef) return true; // base is an ancestor of the snapshot
-          if (!baseIsCommit && c.base !== this.baseRef) return false; // a Commit on another Layer
+          const cid = cleanRef(c.id);
+          const cbase = cleanRef(c.base);
+          if (baseIsCommit && (c.id === this.baseRef || cid === cleanedBaseRef)) return true; // base is an ancestor of the snapshot
+          if (!baseIsCommit && c.base !== this.baseRef && cbase !== cleanedBaseRef) return false; // a Commit on another Layer
         }
         if (!page.hasMore || !(page.items ?? []).length) break;
         pos = page.nextPagePos ?? (pos + page.items.length);
@@ -1308,8 +1854,52 @@ export class LayerfsSession {
     let m: any;
     try {
       m = await this.lfs.branch.merge(branch, other, probe, "containment probe");
-    } catch {
-      return false; // Conflict / NoMergeBase: the base has changes the snapshot lacks
+    } catch (e: any) {
+      if (e?.code === "Conflict" || e?.code === "NoMergeBase") {
+        return false; // Conflict / NoMergeBase: the base has changes the snapshot lacks
+      }
+      // Native merge failed (e.g. InvalidRecord): check content
+      try {
+        const branches = await this.listAllBranches();
+        const otherBranch = branches.find((b) => b.name === other);
+        const otherBase = cleanRef(otherBranch?.base);
+        if (!otherBase) return false;
+        const tmpBase = `c-${this.shortId}-${(++this.seq)}`;
+        await this.lfs.branch.fork(tmpBase, otherBase);
+
+        const items: Array<{ path: string; type: string }> = [];
+        for (let pos = 0; ; ) {
+          const page = await this.lfs.branch.diff_branches(tmpBase, other, 1000, pos, { hunks: false });
+          for (const it of page.items ?? []) items.push(it);
+          if (!page.hasMore || !(page.items ?? []).length) break;
+          pos = page.nextPagePos ?? (pos + page.items.length);
+        }
+
+        const sameBytes = (a: Buffer | null, b: Buffer | null) => {
+          if (a === null && b === null) return true;
+          if (a === null || b === null) return false;
+          return Buffer.compare(a, b) === 0;
+        };
+
+        for (const it of items) {
+          if (it.type === "dir") continue;
+          const rel = it.path.replace(/^\/+/, "");
+          if (!this.isApplicable(rel)) continue;
+          const otherBytes = await readRefBytes(this, other, it.path);
+          const branchBytes = await readRefBytes(this, branch, it.path);
+          if (!sameBytes(otherBytes, branchBytes)) {
+            return false;
+          }
+          const otherSig = await this.readSigAtBranch(other, rel);
+          const branchSig = await this.readSigAtBranch(branch, rel);
+          if (!sameSig(otherSig, branchSig)) {
+            return false;
+          }
+        }
+        return true;
+      } catch {
+        return false;
+      }
     }
     const d = await this.lfs.branch.diff_branches(branch, probe, 1, 0, { hunks: false });
     const same = Boolean(d.from?.root) && d.from?.root === d.to?.root;
@@ -1323,7 +1913,8 @@ export class LayerfsSession {
     const known = this.baseCommitKnown.get(this.baseRef);
     if (known !== undefined) return known;
     const page = await this.lfs.branch.list_commits(this.baseBranch, 1, 0); // errors propagate (not cached)
-    const isCommit = Boolean(page?.items?.[0]?.id === this.baseRef);
+    const cleanedBaseRef = cleanRef(this.baseRef);
+    const isCommit = Boolean(page?.items?.[0]?.id && (page.items[0].id === this.baseRef || cleanRef(page.items[0].id) === cleanedBaseRef));
     this.baseCommitKnown.set(this.baseRef, isCommit);
     return isCommit;
   }
@@ -1350,8 +1941,53 @@ export class LayerfsSession {
 
 // ---------------------------------------------------------------- helpers
 
+async function readRefBytes(s: LayerfsSession, ref: string, sp: string): Promise<Buffer | null> {
+  try {
+    return await s.readBytesAtRef(ref, sp);
+  } catch (e: any) {
+    if (e?.code === "ENOENT" || e?.code === "NoSuchPath" || /not found|does not exist/i.test(e?.message)) {
+      return null;
+    }
+    throw e;
+  }
+}
+
+function isBinary(buf: Buffer): boolean {
+  const len = Math.min(buf.length, 8000);
+  for (let i = 0; i < len; i++) {
+    if (buf[i] === 0) return true;
+  }
+  return false;
+}
+
+function threeWayMerge(ours: Buffer, base: Buffer | null, theirs: Buffer): { merged: Buffer } | { conflict: true } {
+  const tmpDir = mkdtempSync(join(tmpdir(), "lfs-merge-"));
+  const fOurs = join(tmpDir, "ours");
+  const fBase = join(tmpDir, "base");
+  const fTheirs = join(tmpDir, "theirs");
+  try {
+    writeFileSync(fOurs, ours);
+    writeFileSync(fTheirs, theirs);
+    if (base !== null) writeFileSync(fBase, base);
+    else writeFileSync(fBase, Buffer.alloc(0));
+    const res = spawnSync("git", ["merge-file", "-p", "-q", fOurs, fBase, fTheirs], { encoding: "buffer", maxBuffer: 50 * 1024 * 1024 });
+    if (res.status === 0 && res.stdout) {
+      return { merged: res.stdout };
+    }
+    return { conflict: true };
+  } catch {
+    return { conflict: true };
+  } finally {
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
 function enoent(path: string, why: string) {
   return Object.assign(new Error(`ENOENT: ${path}: ${why.trim() || "not found"}`), { code: "ENOENT" });
+}
+
+export function cleanRef(ref?: string | null): string | null {
+  return ref ? String(ref).replace(/^(?:commit|layer):/i, "") : null;
 }
 
 function sameSig(a: { kind: string; sig: string; mode?: number } | null, b: { kind: string; sig: string; mode?: number } | null) {

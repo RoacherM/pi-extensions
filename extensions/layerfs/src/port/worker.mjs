@@ -34,6 +34,49 @@ const binding = createRequire(import.meta.url)(process.env.LAYERFS_NATIVE);
 /** Open Stores by path: { opening, users, timer }. */
 const stores = new Map();
 
+/** Per-storePath mutation queue to serialize SQLite/MergeScratch mutations across concurrent calls. */
+const storeMutations = new Map();
+
+const MUTATING_OPS = new Set([
+  "fs.apply", "fs.write", "fs.edit", "fs.rm", "fs.mv", "fs.mkdir",
+  "workspace.commit", "branch.merge", "branch.publish", "branch.fork",
+]);
+
+/** Calls `made` with up to 3 short backoff retries if the binding answers Busy. */
+async function callWithRetry(fn, op, args) {
+  for (let attempt = 0; ; attempt++) {
+    const answer = await made(binding, fn, op, args);
+    if (attempt < 3 && answer?.refused?.code === "Busy") {
+      const backoff = 50 * Math.pow(2, attempt);
+      await new Promise((r) => setTimeout(r, backoff));
+      continue;
+    }
+    return answer;
+  }
+}
+
+/** Serializes mutating operations per storePath. */
+async function runCall(fn, op, args) {
+  const key = args?.storePath || (args?.home && args?.project ? `${args.home}:${args.project}` : null);
+  if (!key || !MUTATING_OPS.has(op)) {
+    return callWithRetry(fn, op, args);
+  }
+  const prev = storeMutations.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  const chain = prev.then(() => current, () => current);
+  storeMutations.set(key, chain);
+  await prev.catch(() => {});
+  try {
+    return await callWithRetry(fn, op, args);
+  } finally {
+    release();
+    if (storeMutations.get(key) === chain) {
+      storeMutations.delete(key);
+    }
+  }
+}
+
 /** Runs `work` with the call's Store open: a Store that does not open answers its refusal. */
 async function withStore(args, work) {
   const key = args.storePath;
@@ -60,7 +103,7 @@ async function withStore(args, work) {
 }
 
 async function answer({ fn, op, args, open }) {
-  const call = () => made(binding, fn, op, args);
+  const call = () => runCall(fn, op, args);
   try {
     return await (open ? withStore(args, call) : call());
   } catch (error) {

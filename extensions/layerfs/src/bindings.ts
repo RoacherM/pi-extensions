@@ -26,6 +26,7 @@ export interface SessionBinding {
   unapplied: boolean;
   seq: number;
   updatedAt: number;
+  logicalBranch?: string;
 }
 
 export interface HostEntry {

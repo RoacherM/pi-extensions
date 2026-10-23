@@ -27,6 +27,8 @@ export interface LayerfsConfig {
   branchOnly: string[];
   /** team mode: agent-facing `layerfs` tool (+ `layerfs_apply` for the top-level session) */
   team: boolean;
+  /** logical branch name alias (e.g. lead, or from PI_LAYERFS_BRANCH_NAME) */
+  branchName?: string;
 }
 
 export const DEFAULT_EXCLUDES = [
@@ -48,5 +50,6 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): LayerfsConf
     envAllow: list(env.PI_LAYERFS_ENV_ALLOW, ["TERM", "LANG", "LC_ALL", "CI", "NO_COLOR", "FORCE_COLOR"]),
     branchOnly: list(env.PI_LAYERFS_BRANCH_ONLY, []),
     team: env.PI_LAYERFS_TEAM === "1",
+    branchName: env.PI_LAYERFS_BRANCH_NAME || undefined,
   };
 }

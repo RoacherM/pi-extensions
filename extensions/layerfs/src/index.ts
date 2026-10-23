@@ -14,7 +14,7 @@ import {
   DEFAULT_MAX_BYTES, formatSize, truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { resolveConfig } from "./config.ts";
-import { LayerfsSession, type Checkpoint } from "./workspace.ts";
+import { isExcludedPath, LayerfsSession, type Checkpoint } from "./workspace.ts";
 import { formatHistory, hiddenPath, loadHistory } from "./history.ts";
 
 export const CHECKPOINT_ENTRY = "layerfs-checkpoint";
@@ -183,19 +183,26 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       label: "LayerFS",
       description: [
         "Inspect and combine LayerFS branches of this project (your file tools and bash work on your own branch).",
-        "action=status: your branch name (report it to whoever merges your work), head, whether you have unapplied changes.",
-        "action=diff: files your branch changed (build output that never reaches the user's folder is counted, not listed).",
-        "action=branches: all branches of the project.",
-        "action=sync: merge the project's trunk (main: what was last applied to the user's folder) into your branch.",
-        "action=merge branch=<name>: merge another branch (e.g. a teammate's) into yours. On conflict nothing changes and the conflicting files are listed.",
-        "action=show branch=<name> path=<file>: print a file as it is on another branch (to resolve conflicts).",
+        "action=status: your branch name and alias (report alias to whoever merges your work), head, whether you have unapplied changes.",
+        "action=diff [branch=<name>] [base=<name>]: files changed on your branch or between specified branches (build output is counted, not listed).",
+        "action=branches: active branches of the project (with aliases).",
+        "action=sync [branch=<name>] [strategy=ours|theirs]: merge trunk (main) or a specified branch (e.g. branch='lead') into your branch.",
+        "action=merge branch=<name> [strategy=ours|theirs]: merge another branch into yours. On conflict nothing changes and conflicts are listed.",
+        "action=show branch=<name> path=<file> [offset=1] [limit=N]: print a file (or list directory) from another branch (supports pagination).",
+        "action=ls [branch=<name>] [path=/]: list directory entries on a branch.",
+        "action=checkout branch=<name> (path=<file>|paths=[...]): copy files or directories from another branch into your branch.",
       ].join(" "),
       parameters: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["status", "diff", "branches", "sync", "merge", "show"] },
-          branch: { type: "string", description: "branch to merge (action=merge) or read from (action=show)" },
-          path: { type: "string", description: "file path, relative to the project root (action=show)" },
+          action: { type: "string", enum: ["status", "diff", "branches", "sync", "merge", "show", "ls", "checkout"] },
+          branch: { type: "string", description: "branch to merge (action=merge), read from (action=show/ls/checkout), or diff (action=diff/sync)" },
+          base: { type: "string", description: "base branch to diff against (action=diff)" },
+          path: { type: "string", description: "file or directory path (action=show, action=ls, action=checkout)" },
+          paths: { type: "array", items: { type: "string" }, description: "multiple file or directory paths to copy (action=checkout)" },
+          strategy: { type: "string", enum: ["ours", "theirs"], description: "conflict resolution strategy: 'ours' keeps your branch's version, 'theirs' takes the other branch's version" },
+          offset: { type: "integer", description: "1-indexed starting line number (action=show, default: 1)" },
+          limit: { type: "integer", description: "maximum lines to show (action=show)" },
         },
         required: ["action"],
         additionalProperties: false,
@@ -206,13 +213,33 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         const action = params?.action;
         if (action === "status") {
           return text([
-            `branch: ${s.workBranch}`,
+            `branch: ${s.workBranch} (alias: ${s.logicalBranch})`,
             `head: ${s.headCommit ?? "none (no changes yet)"}`,
             `unapplied changes: ${s.unapplied ? "yes" : "no"}`,
             s.blocked ? `BLOCKED: ${s.blocked.reason}` : "",
           ].filter(Boolean).join("\n"));
         }
         if (action === "diff") {
+          if (params?.branch) {
+            const resolvedBranch = await s.resolveBranchName(params.branch);
+            const resolvedBase = params?.base ? await s.resolveBranchName(params.base) : s.baseBranch;
+            const all: Array<{ path: string; kind: string; type: string }> = [];
+            for (let pos = 0; ; ) {
+              const page = await s.lfs.branch.diff_branches(resolvedBase, resolvedBranch, 1000, pos, { hunks: false });
+              for (const it of page.items ?? []) {
+                if (it.path === "/.lww" || !it.path || it.type === "dir" || hiddenPath(it.path)) continue;
+                all.push({ path: it.path, kind: it.kind, type: it.type });
+              }
+              if (!page.hasMore || !(page.items ?? []).length) break;
+              pos = page.nextPagePos ?? (pos + page.items.length);
+            }
+            const d = all.filter((i) => s.isApplicable(i.path));
+            const lines = d.slice(0, 300).map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`);
+            if (d.length > 300) lines.push(`… ${d.length - 300} more`);
+            const other = all.length - d.length;
+            if (other) lines.push(`(+${other} branch-only/build files, never applied)`);
+            return text(lines.length ? lines.join("\n") : `No changes between ${resolvedBase} and ${resolvedBranch}.`);
+          }
           const all = (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path));
           const d = all.filter((i) => s.isApplicable(i.path));
           const lines = d.slice(0, 300).map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`);
@@ -222,37 +249,179 @@ export default function layerfsExtension(pi: ExtensionAPI) {
           return text(lines.length ? lines.join("\n") : "No changes on this branch.");
         }
         if (action === "branches") {
-          const list = await s.listAllBranches();
-          return text(list.map((b) => `${b.name}${b.name === s.workBranch ? " (yours)" : ""} head ${(b.head ?? "-").slice(0, 12)}`).join("\n"));
+          const list = await s.listUserBranches();
+          return text(list.map((b) => `${b.name}${b.isYours ? " (yours)" : ""}${b.logicalBranch && b.logicalBranch !== b.name ? ` (alias: ${b.logicalBranch})` : ""} head ${(b.head ?? "-").slice(0, 12)}`).join("\n"));
         }
         if (action === "show") {
           const b = String(params?.branch ?? "").trim();
-          const rel = String(params?.path ?? "").trim().replace(/^\.?\/+/, "").replace(new RegExp(`^${s.cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/`), "");
-          if (!b || !rel) throw new Error("action=show needs branch=<name> and path=<file>");
-          if (!s.isApplicable(rel) && rel !== ".lww") throw new Error(`${rel} is not readable here (secret, git metadata or build output)`);
-          const r: any = await s.lfs.fs.read(b, `/${rel}`);
-          const body = r?.text ?? (r?.bytes ? Buffer.from(r.bytes).toString("utf8") : "");
-          return text(body.length > 50_000 ? `${body.slice(0, 50_000)}\n… (truncated)` : body);
+          const rawPath = String(params?.path ?? "").trim();
+          if (!b || !rawPath) throw new Error("action=show needs branch=<name> and path=<file>");
+          const resolvedBranch = await s.resolveBranchName(b);
+          const rel = rawPath.replace(/^\.?\/+/, "").replace(new RegExp(`^${s.cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/`), "");
+          if (rel && !s.isApplicable(rel) && rel !== ".lww") throw new Error(`${rel} is not readable here (secret, git metadata or build output)`);
+          const storePath = rel ? `/${rel}` : "/";
+          const st = await s.lfs.fs.stat(resolvedBranch, storePath).catch(() => null);
+          if (!st) throw new Error(`ENOENT: ${rawPath} does not exist on branch ${resolvedBranch}`);
+          if (st.type === "dir") {
+            const entries: string[] = [];
+            for (let pos = 0; ; ) {
+              const page = await s.lfs.fs.list(resolvedBranch, storePath, 1000, pos);
+              for (const it of page.items ?? []) {
+                if (it.name === ".lww" || it.name === ".git" || it.name.startsWith(".git/")) continue;
+                const itRel = it.path.replace(/^\/+/, "");
+                if (isExcludedPath(itRel, s.config.excludes)) continue;
+                entries.push(it.type === "dir" ? `${it.name}/` : it.name);
+              }
+              if (!page.hasMore || !(page.items ?? []).length) break;
+              pos = page.nextPagePos ?? (pos + page.items.length);
+            }
+            entries.sort();
+            return text(entries.length ? entries.join("\n") : "(empty directory)");
+          }
+          const fullBytes = await s.readBytesAtRef(resolvedBranch, storePath, rel);
+          const fullText = fullBytes.toString("utf8");
+          const allLines = fullText.length === 0 ? [] : (fullText.endsWith("\n") ? fullText.slice(0, -1).split(/\r?\n/) : fullText.split(/\r?\n/));
+          const totalLines = allLines.length;
+          const offset = Math.max(1, Number(params?.offset ?? 1));
+          const limit = params?.limit !== undefined ? Math.max(1, Number(params.limit)) : undefined;
+
+          if (totalLines === 0) {
+            return text("");
+          }
+
+          if (offset > totalLines) {
+            return text(`(offset ${offset} is past end of file; file has ${totalLines} lines)`);
+          }
+
+          const selectedLines: string[] = [];
+          let currentBytes = 0;
+          let nextLine = offset;
+          for (let i = offset - 1; i < totalLines; i++) {
+            if (limit !== undefined && selectedLines.length >= limit) break;
+            const line = allLines[i];
+            const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+            if (selectedLines.length > 0 && currentBytes + lineBytes > 100_000) {
+              break;
+            }
+            selectedLines.push(line);
+            currentBytes += lineBytes;
+            nextLine = i + 2;
+          }
+          const endLine = offset + selectedLines.length - 1;
+          const isTruncated = endLine < totalLines;
+          if (!isTruncated && offset === 1 && limit === undefined) {
+            return text(fullText);
+          }
+          let output = selectedLines.join("\n");
+          if (isTruncated) {
+            output += `\n… (truncated: showing lines ${offset}-${endLine} of ${totalLines}, total ${fullBytes.length} bytes; pass offset=${nextLine} to read more, or use action="checkout" to copy the file)`;
+          }
+          return text(output);
+        }
+        if (action === "ls") {
+          const b = params?.branch ? await s.resolveBranchName(params.branch) : s.workBranch;
+          const rawPath = String(params?.path ?? "/").trim();
+          const rel = rawPath.replace(/^\.?\/+/, "").replace(new RegExp(`^${s.cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/`), "");
+          const storePath = rel ? `/${rel}` : "/";
+          const entries: string[] = [];
+          for (let pos = 0; ; ) {
+            const page = await s.lfs.fs.list(b, storePath, 1000, pos);
+            for (const it of page.items ?? []) {
+              if (it.name === ".lww" || it.name === ".git" || it.name.startsWith(".git/")) continue;
+              const itRel = it.path.replace(/^\/+/, "");
+              if (isExcludedPath(itRel, s.config.excludes)) continue;
+              entries.push(it.type === "dir" ? `${it.name}/` : it.name);
+            }
+            if (!page.hasMore || !(page.items ?? []).length) break;
+            pos = page.nextPagePos ?? (pos + page.items.length);
+          }
+          entries.sort();
+          return text(entries.length ? entries.join("\n") : "(empty directory)");
+        }
+        if (action === "checkout") {
+          const b = String(params?.branch ?? "").trim();
+          if (!b) throw new Error("action=checkout needs branch=<name>");
+          const resolvedBranch = await s.resolveBranchName(b);
+          const rawPaths = params?.paths ? (Array.isArray(params.paths) ? params.paths : [params.paths]) : (params?.path ? [params.path] : []);
+          if (!rawPaths.length) throw new Error("action=checkout needs path=<file> or paths=[...]");
+
+          const r = await s.mutate("checkout", "checkout", async () => {
+            const copied: Array<{ path: string; size: number }> = [];
+
+            const collectFiles = async (dirSp: string): Promise<string[]> => {
+              const files: string[] = [];
+              for (let pos = 0; ; ) {
+                const page = await s.lfs.fs.list(resolvedBranch, dirSp, 1000, pos);
+                for (const item of page.items ?? []) {
+                  if (item.name === ".lww" || item.name === ".git" || item.name.startsWith(".git/")) continue;
+                  const itemRel = item.path.replace(/^\/+/, "");
+                  if (isExcludedPath(itemRel, s.config.excludes)) continue;
+                  if (item.type === "dir") {
+                    files.push(...(await collectFiles(item.path)));
+                  } else {
+                    files.push(itemRel);
+                  }
+                }
+                if (!page.hasMore || !(page.items ?? []).length) break;
+                pos = page.nextPagePos ?? (pos + page.items.length);
+              }
+              return files;
+            };
+
+            for (const targetPath of rawPaths) {
+              const rel = String(targetPath).trim().replace(/^\.?\/+/, "").replace(new RegExp(`^${s.cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/`), "");
+              const storePath = rel ? `/${rel}` : "/";
+              const st = await s.lfs.fs.stat(resolvedBranch, storePath).catch(() => null);
+              if (!st) throw new Error(`action=checkout: "${targetPath}" does not exist on branch ${resolvedBranch}`);
+              if (st.type === "dir") {
+                const dirFiles = await collectFiles(storePath);
+                for (const fileRel of dirFiles) {
+                  const bytes = await s.readBytesAtRef(resolvedBranch, "/" + fileRel, fileRel);
+                  await s.writeFile(path.join(s.cwd, fileRel), bytes);
+                  copied.push({ path: fileRel, size: bytes.length });
+                }
+              } else {
+                const bytes = await s.readBytesAtRef(resolvedBranch, storePath, rel);
+                await s.writeFile(path.join(s.cwd, rel), bytes);
+                copied.push({ path: rel, size: bytes.length });
+              }
+            }
+            return copied;
+          });
+
+          status(ctx, describe(s));
+          const copied = r.value;
+          const lines = [
+            `Checked out ${copied.length} file(s) from ${resolvedBranch}:`,
+            ...copied.map((c) => `  ${c.path} (${c.size} bytes)`),
+          ];
+          return text(lines.join("\n"));
         }
         if (action === "sync" || action === "merge") {
-          const other = action === "sync" ? "main" : String(params?.branch ?? "").trim();
-          if (!other) throw new Error("action=merge needs branch=<name> (see action=branches)");
+          const branchParam = action === "sync" ? (params?.branch || "main") : params?.branch;
+          const target = String(branchParam ?? "").trim();
+          if (!target) throw new Error("action=merge needs branch=<name> (see action=branches)");
+          const other = await s.resolveBranchName(target);
           if (other === s.workBranch) throw new Error("that is your own branch");
-          const r = await s.mergeBranch(other);
+          const strategy = params?.strategy;
+          if (strategy && strategy !== "ours" && strategy !== "theirs") {
+            throw new Error(`invalid strategy "${strategy}": expected "ours" or "theirs"`);
+          }
+          const r = await s.mergeBranch(other, strategy ? { strategy } : undefined);
           status(ctx, describe(s));
           if (!r.merged) {
             return text([
               `CONFLICT merging ${other}: nothing changed (you are still on ${s.workBranch}).`,
               "Conflicting files:", ...r.conflicts.map((c) => `  ${c.path}${c.kind ? ` (${c.kind})` : ""}`),
               "How to resolve (LayerFS merges three-way, so editing only your side keeps conflicting):",
-              `  1. On your branch, make each conflicting file equal to the other side's version (read it with action=show branch=${other} path=<file>), keeping your own version in mind;`,
-              `  2. merge ${other} again (it is now clean);`,
-              "  3. edit the files on your branch to the combined result you want.",
-              "Alternatively send the conflict back to the other branch's owner.",
+              `  1. Run with strategy: action="merge" branch="${target}" strategy="theirs" (or strategy="ours");`,
+              `  2. Or inspect with action=show branch=${other} path=<file>, checkout files with action=checkout branch=${other} path=<file>, or edit your files.`,
             ].join("\n"));
           }
           recordMerge(s, other, r);
-          return text(`Merged ${other}. You are now on ${r.branch}${r.lww ? ` (${r.lww} generated file(s) took the newer side)` : ""}.`);
+          const lwwInfo = r.lww ? (r.lwwPaths?.length ? ` (${r.lww} generated file(s) took the newer side: ${r.lwwPaths.slice(0, 5).join(", ")}${r.lwwPaths.length > 5 ? ", …" : ""})` : ` (${r.lww} generated file(s) took the newer side)`) : "";
+          const fallbackInfo = (r as any).fallback ? " (via path-wise merge)" : "";
+          return text(`Merged ${other}${fallbackInfo}. You are now on ${r.branch}${lwwInfo}.`);
         }
         throw new Error(`unknown action ${action}`);
       },
@@ -454,7 +623,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         return say([
           describe(s),
           `project ${s.project} · volume ${s.volume}`,
-          `branch ${s.workBranch} (base ${s.baseBranch} @ ${s.baseRef.slice(0, 12)}) · head ${(s.headCommit ?? "none").slice(0, 12)}`,
+          `branch ${s.workBranch} (alias: ${s.logicalBranch}, base ${s.baseBranch} @ ${s.baseRef.slice(0, 12)}) · head ${(s.headCommit ?? "none").slice(0, 12)}`,
           s.blocked ? `blocked: ${s.blocked.reason}` : "",
         ].filter(Boolean).join("\n"));
       }
@@ -464,19 +633,38 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         return say(formatHistory(await loadHistory(s, limit)));
       }
       if (sub === "branches") {
-        const list = await s.listAllBranches();
-        return say(list.map((b) => `${b.name.padEnd(20)} head ${(b.head ?? "-").slice(0, 12)} base ${(b.base ?? "-").slice(0, 12)}`).join("\n"));
+        const list = await s.listUserBranches();
+        return say(list.map((b) => `${b.name.padEnd(20)} ${(b.logicalBranch ? `[${b.logicalBranch}]` : "").padEnd(14)} head ${(b.head ?? "-").slice(0, 12)} base ${(b.base ?? "-").slice(0, 12)}`).join("\n"));
       }
       if (sub === "merge") {
-        const other = argv[1];
-        if (!other) return say("用法：/layerfs merge <branch>（分支名见 /layerfs branches）", "warning");
-        const r = await s.mergeBranch(other);
+        const otherParam = argv[1];
+        if (!otherParam) return say("用法：/layerfs merge <branch> [--ours|--theirs]（分支名见 /layerfs branches）", "warning");
+        const strategy = argv.includes("--theirs") ? "theirs" : argv.includes("--ours") ? "ours" : undefined;
+        const other = await s.resolveBranchName(otherParam);
+        const r = await s.mergeBranch(other, strategy ? { strategy } : undefined);
         status(ctx, describe(s));
         if (!r.merged) return say([`Conflict merging ${other}; nothing changed. Conflicting files:`, ...r.conflicts.map((c) => `  ${c.path}${c.kind ? ` (${c.kind})` : ""}`)].join("\n"), "error");
         recordMerge(s, other, r);
-        return say(`Merged ${other} into this session (now on ${r.branch}${r.lww ? `, ${r.lww} generated file(s) took the newer side` : ""}). /layerfs diff to review, /layerfs apply to write to your folder.`);
+        const lwwInfo = r.lww ? (r.lwwPaths?.length ? `, ${r.lww} generated file(s) took the newer side: ${r.lwwPaths.slice(0, 5).join(", ")}${r.lwwPaths.length > 5 ? ", …" : ""}` : `, ${r.lww} generated file(s) took the newer side`) : "";
+        return say(`Merged ${other} into this session (now on ${r.branch}${lwwInfo}). /layerfs diff to review, /layerfs apply to write to your folder.`);
       }
       if (sub === "diff") {
+        if (argv[1]) {
+          const targetBranch = await s.resolveBranchName(argv[1]);
+          const baseBranch = argv[2] ? await s.resolveBranchName(argv[2]) : s.baseBranch;
+          const all: Array<{ path: string; kind: string; type: string }> = [];
+          for (let pos = 0; ; ) {
+            const page = await s.lfs.branch.diff_branches(baseBranch, targetBranch, 1000, pos, { hunks: false });
+            for (const it of page.items ?? []) {
+              if (it.path === "/.lww" || !it.path || it.type === "dir" || hiddenPath(it.path)) continue;
+              all.push({ path: it.path, kind: it.kind, type: it.type });
+            }
+            if (!page.hasMore || !(page.items ?? []).length) break;
+            pos = page.nextPagePos ?? (pos + page.items.length);
+          }
+          const d = all.filter((i) => s.isApplicable(i.path));
+          return say(d.length ? d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`).join("\n") : `No changes between ${baseBranch} and ${targetBranch}.`);
+        }
         const d = await applicableDiff(s);
         return say(d.length ? d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`).join("\n") : "No changes in the LayerFS workspace.");
       }
