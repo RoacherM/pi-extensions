@@ -21,6 +21,16 @@ export const CHECKPOINT_ENTRY = "layerfs-checkpoint";
 export const SESSION_ENTRY = "layerfs-session";
 const IMAGE_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
 
+const cleanRel = (s: LayerfsSession, raw: string): string => {
+  const trimmed = String(raw ?? "").trim();
+  if (!trimmed || trimmed === "/" || trimmed === ".") return "";
+  if (path.isAbsolute(trimmed)) {
+    const r = s.toRel(trimmed);
+    if (r !== null) return r;
+  }
+  return trimmed.replace(/^\.?\/+/, "");
+};
+
 export default function layerfsExtension(pi: ExtensionAPI) {
   pi.registerFlag("no-layerfs", { description: "Disable LayerFS isolation for this run (tools act on the host folder)", type: "boolean", default: false });
 
@@ -266,7 +276,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
           const rawPath = String(params?.path ?? "").trim();
           if (!b || !rawPath) throw new Error("action=show needs branch=<name> and path=<file>");
           const resolvedBranch = await s.resolveBranchName(b);
-          const rel = rawPath.replace(/^\.?\/+/, "").replace(new RegExp(`^${s.cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/`), "");
+          const rel = cleanRel(s, rawPath);
           if (rel && !s.isApplicable(rel) && rel !== ".lww") throw new Error(`${rel} is not readable here (secret, git metadata or build output)`);
           const storePath = rel ? `/${rel}` : "/";
           const st = await s.lfs.fs.stat(resolvedBranch, storePath).catch(() => null);
@@ -330,7 +340,8 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         if (action === "ls") {
           const b = params?.branch ? await s.resolveBranchName(params.branch) : s.workBranch;
           const rawPath = String(params?.path ?? "/").trim();
-          const rel = rawPath.replace(/^\.?\/+/, "").replace(new RegExp(`^${s.cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/`), "");
+          const rel = cleanRel(s, rawPath);
+          if (rel && !s.isApplicable(rel)) throw new Error(`${rel} is not readable here (secret, git metadata or build output)`);
           const storePath = rel ? `/${rel}` : "/";
           const entries: string[] = [];
           for (let pos = 0; ; ) {
@@ -338,7 +349,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
             for (const it of page.items ?? []) {
               if (it.name === ".lww" || it.name === ".git" || it.name.startsWith(".git/")) continue;
               const itRel = it.path.replace(/^\/+/, "");
-              if (isExcludedPath(itRel, s.config.excludes)) continue;
+              if (isExcludedPath(itRel, s.config.excludes) || !s.isApplicable(itRel)) continue;
               entries.push(it.type === "dir" ? `${it.name}/` : it.name);
             }
             if (!page.hasMore || !(page.items ?? []).length) break;
@@ -365,6 +376,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
                   if (item.name === ".lww" || item.name === ".git" || item.name.startsWith(".git/")) continue;
                   const itemRel = item.path.replace(/^\/+/, "");
                   if (isExcludedPath(itemRel, s.config.excludes)) continue;
+                  if (!s.isApplicable(itemRel)) continue;
                   if (item.type === "dir") {
                     files.push(...(await collectFiles(item.path)));
                   } else {
@@ -378,13 +390,15 @@ export default function layerfsExtension(pi: ExtensionAPI) {
             };
 
             for (const targetPath of rawPaths) {
-              const rel = String(targetPath).trim().replace(/^\.?\/+/, "").replace(new RegExp(`^${s.cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/`), "");
+              const rel = cleanRel(s, targetPath);
+              if (rel && !s.isApplicable(rel)) throw new Error(`${rel} cannot be checked out (secret, git metadata or build output)`);
               const storePath = rel ? `/${rel}` : "/";
               const st = await s.lfs.fs.stat(resolvedBranch, storePath).catch(() => null);
               if (!st) throw new Error(`action=checkout: "${targetPath}" does not exist on branch ${resolvedBranch}`);
               if (st.type === "dir") {
                 const dirFiles = await collectFiles(storePath);
                 for (const fileRel of dirFiles) {
+                  if (fileRel && !s.isApplicable(fileRel)) throw new Error(`${fileRel} cannot be checked out (secret, git metadata or build output)`);
                   const bytes = await s.readBytesAtRef(resolvedBranch, "/" + fileRel, fileRel);
                   await s.writeFile(path.join(s.cwd, fileRel), bytes);
                   copied.push({ path: fileRel, size: bytes.length });

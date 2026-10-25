@@ -15,9 +15,9 @@ export class DockerError extends Error {
 }
 
 /** Runs one docker CLI command to completion. Never inherits the host env beyond PATH/HOME/DOCKER_*. */
-export function run(docker: string, args: string[], options: { input?: Buffer | string; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<RunResult> {
+export function run(docker: string, args: string[], options: { input?: Buffer | string; timeoutMs?: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv } = {}): Promise<RunResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(docker, args, { stdio: ["pipe", "pipe", "pipe"], env: dockerEnv() });
+    const child = spawn(docker, args, { stdio: ["pipe", "pipe", "pipe"], env: options.env ? { ...dockerEnv(), ...options.env } : dockerEnv() });
     const out: Buffer[] = [];
     let err = "";
     child.stdout.on("data", (d) => out.push(d));

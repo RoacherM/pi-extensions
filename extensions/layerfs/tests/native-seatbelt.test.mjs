@@ -47,6 +47,7 @@ const config = {
   root,
   prefix: `pi-nat-${id}-`,
   killGraceMs: 800,
+  excludes: [...resolveConfig().excludes, "*.env", "**/secrets/*.key", "secrets/"],
 };
 
 function fixture(dir) {
@@ -263,6 +264,167 @@ try {
     assert.match(chunksAuth.join(""), /Operation not permitted/);
   });
 
+  await step("3.5 P0-1: git core.fsmonitor execution prevention and .git/config / .git/hooks / .lww write protection", async () => {
+    const pwnedPath = join(base, "pwned-p01");
+    rmSync(pwnedPath, { force: true });
+
+    // In bash: git config core.fsmonitor fails with EPERM because .git/config is write-denied in Seatbelt
+    const chunks = [];
+    const r = await sA.mutate("sec-p01-a", "bash", () =>
+      sA.exec(`git config core.fsmonitor "touch ${pwnedPath}"`, cwd, { onData: (d) => chunks.push(d.toString()) })
+    );
+    assert.notEqual(r.value.exitCode, 0);
+    assert.match(chunks.join(""), /Operation not permitted/);
+
+    // mustStorePath refuses writes to .lww, .git/config, .git/hooks
+    await assert.rejects(
+      sA.writeFile(join(cwd, ".git/config"), "bad"),
+      (e) => e.code === "EACCES" && /refused for security/.test(e.message)
+    );
+    await assert.rejects(
+      sA.writeFile(join(cwd, ".lww"), "bad"),
+      (e) => e.code === "EACCES" && /refused for security/.test(e.message)
+    );
+    await assert.rejects(
+      sA.writeFile(join(cwd, ".git/hooks/pre-commit"), "bad"),
+      (e) => e.code === "EACCES" && /refused for security/.test(e.message)
+    );
+
+    // Even if injected directly into Store .git/config, prepareNativeGit runs git with -c core.fsmonitor=false -c core.hooksPath=/dev/null and GIT_CONFIG_*=/dev/null
+    await sA.lfs.fs.apply(sA.workBranch, [
+      { op: "write", path: "/.git/config", bytes: Buffer.from(`[core]\n\tfsmonitor = "touch ${pwnedPath}"\n`) }
+    ], "inject malicious git config");
+
+    const execRes = await sA.exec("true", cwd, { onData: () => {} });
+    assert.equal(execRes.exitCode, 0);
+    assert.equal(existsSync(pwnedPath), false, "malicious fsmonitor must never be executed");
+
+    // Clean up injected git config
+    await sA.lfs.fs.apply(sA.workBranch, [{ op: "rm", path: "/.git/config" }], "cleanup git config");
+  });
+
+  await step("3.6 P0-2: symlinked paths must not read secrets or write outside workspace", async () => {
+    const pwnedFile = join(base, "pwned-p02.txt");
+    rmSync(pwnedFile, { force: true });
+
+    // Create symlinks in workspace via bash (including a dangling final symlink pointing to a non-existent file outside workspace, AND a valid in-workspace symlink)
+    await sA.mutate("sec-p02-sym", "bash", () =>
+      sA.exec(`ln -s ~/.ssh/config sym-read && ln -s "${base}" sym-dir && ln -s "${pwnedFile}" sym-dangling && ln -s src/app.js sym-valid-in-ws`, cwd, { onData: () => {} })
+    );
+
+    // Valid in-workspace symlink write MUST succeed and update the target inside the workspace
+    await sA.mutate("sec-p02-valid", "write", () =>
+      sA.writeFile(join(cwd, "sym-valid-in-ws"), "export const a = 123;\n")
+    );
+    assert.equal((await sA.readFile(join(cwd, "src/app.js"))).toString(), "export const a = 123;\n");
+
+    // readFile on sym-read pointing to secret must be refused
+    await assert.rejects(
+      sA.readFile(join(cwd, "sym-read")),
+      (e) => e.code === "ENOENT"
+    );
+
+    // writeFile through sym-dir pointing outside workspace must be refused
+    await assert.rejects(
+      sA.writeFile(join(cwd, "sym-dir/pwned-p02.txt"), "hacked"),
+      /refusing to write through a symlink pointing outside the LayerFS workspace/
+    );
+    // writeFile through dangling final symlink pointing outside workspace must ALSO be refused
+    await assert.rejects(
+      sA.writeFile(join(cwd, "sym-dangling"), "hacked"),
+      /refusing to write through a symlink pointing outside the LayerFS workspace/
+    );
+    assert.equal(existsSync(pwnedFile), false, "file outside workspace must never be written through symlink");
+  });
+
+  await step("3.7 P1-1: configRoot isolation (stores, bindings.json, daemon.setup) and mount_nfs blocking", async () => {
+    // Reading bindings.json fails with EPERM
+    const chunksBindings = [];
+    await sA.exec(`cat "${sA.config.root}/state/bindings.json"`, cwd, { onData: (d) => chunksBindings.push(d.toString()) });
+    assert.match(chunksBindings.join(""), /Operation not permitted/);
+
+    // Listing stores fails with EPERM
+    const chunksStores = [];
+    await sA.exec(`ls "${sA.boxSpec.stores}"`, cwd, { onData: (d) => chunksStores.push(d.toString()) });
+    assert.match(chunksStores.join(""), /Operation not permitted/);
+
+    // Reading daemon.setup fails with EPERM
+    const setupDir = (await fsp.readdir(sA.boxSpec.localDir).catch(() => []))[0];
+    const daemonSetupPath = setupDir ? join(sA.boxSpec.localDir, setupDir, "config", "daemon.setup") : join(sA.boxSpec.localDir, "default", "config", "daemon.setup");
+    const chunksDaemon = [];
+    await sA.exec(`cat "${daemonSetupPath}"`, cwd, { onData: (d) => chunksDaemon.push(d.toString()) });
+    assert.match(chunksDaemon.join(""), /Operation not permitted/);
+
+    // /sbin/mount_nfs is blocked by process-exec deny, and copying it to /tmp/m is blocked from mounting by (deny file-mount)
+    const chunksMount = [];
+    await sA.exec("/sbin/mount_nfs 2>&1 || true", cwd, { onData: (d) => chunksMount.push(d.toString()) });
+    assert.match(chunksMount.join(""), /Operation not permitted/);
+
+    const chunksCopyMount = [];
+    const rCopyMount = await sA.exec("mkdir -p /private/tmp/mnt-test-$$ && cp /sbin/mount_nfs /private/tmp/m-$$ && /private/tmp/m-$$ -o vers=3,tcp,port=65530,mountport=65530 127.0.0.1:/ /private/tmp/mnt-test-$$ 2>&1; rc=$?; rm -rf /private/tmp/m-$$ /private/tmp/mnt-test-$$; exit $rc", cwd, { onData: (d) => chunksCopyMount.push(d.toString()) });
+    assert.notEqual(rCopyMount.exitCode, 0, "copied mount_nfs must fail to mount under (deny file-mount)");
+  });
+
+  await step("3.8 P1-2 & P1-3: unanchored glob protection (.env, *.pem), system CA cert.pem carve-out, and **/ patterns", async () => {
+    // 3.8a: Reading ${base}/other.env and ${base}/private.pem outside the project fails with EPERM,
+    // while reading macOS system CA bundle /private/etc/ssl/cert.pem succeeds so HTTPS works!
+    const otherEnvPath = join(base, "other.env");
+    const otherPemPath = join(base, "private.pem");
+    writeFileSync(otherEnvPath, "SECRET=outside-env\n");
+    writeFileSync(otherPemPath, "PRIVATE KEY\n");
+
+    const chunksOtherEnv = [];
+    await sA.exec(`cat "${otherEnvPath}"`, cwd, { onData: (d) => chunksOtherEnv.push(d.toString()) });
+    assert.match(chunksOtherEnv.join(""), /Operation not permitted/);
+
+    const chunksOtherPem = [];
+    await sA.exec(`cat "${otherPemPath}"`, cwd, { onData: (d) => chunksOtherPem.push(d.toString()) });
+    assert.match(chunksOtherPem.join(""), /Operation not permitted/);
+
+    const chunksSysCert = [];
+    const rSysCert = await sA.exec("head -n 1 /private/etc/ssl/cert.pem", cwd, { onData: (d) => chunksSysCert.push(d.toString()) });
+    assert.equal(rSysCert.exitCode, 0, `system CA cert.pem must remain readable: ${chunksSysCert.join("")}`);
+
+    // 3.8b: Pattern **/secrets/*.key matches nested directories
+    await sA.lfs.fs.apply(sA.workBranch, [
+      { op: "mkdir", path: "/nested" },
+      { op: "mkdir", path: "/nested/deep" },
+      { op: "mkdir", path: "/nested/deep/secrets" },
+      { op: "write", path: "/nested/deep/secrets/deep.key", bytes: Buffer.from("SECRET_DEEP_KEY\n") },
+    ], "inject test key");
+
+    const chunksNestedKey = [];
+    await sA.exec("cat nested/deep/secrets/deep.key", cwd, { onData: (d) => chunksNestedKey.push(d.toString()) });
+    assert.match(chunksNestedKey.join(""), /Operation not permitted/);
+
+    // 3.8c: Directory-only pattern secrets/ blocks unlinking/renaming secrets directory
+    await sA.lfs.fs.apply(sA.workBranch, [
+      { op: "mkdir", path: "/secrets" },
+      { op: "write", path: "/secrets/temp.txt", bytes: Buffer.from("temp\n") },
+    ], "inject secrets dir");
+
+    const chunksMvSecrets = [];
+    await sA.exec("mv secrets secrets_exposed", cwd, { onData: (d) => chunksMvSecrets.push(d.toString()) });
+    assert.match(chunksMvSecrets.join(""), /Operation not permitted/);
+
+    // Clean up
+    await sA.lfs.fs.apply(sA.workBranch, [
+      { op: "rm", path: "/nested/deep/secrets/deep.key" },
+      { op: "rm", path: "/secrets/temp.txt" },
+      { op: "rm", path: "/secrets" },
+    ], "cleanup test secrets");
+  });
+
+  await step("3.9 P2-2: mv .git .g inside bash fails with Operation not permitted", async () => {
+    const chunks = [];
+    const r = await sA.mutate("sec-p22", "bash", () =>
+      sA.exec("mv .git .g", cwd, { onData: (d) => chunks.push(d.toString()) })
+    );
+    assert.notEqual(r.value.exitCode, 0);
+    assert.match(chunks.join(""), /Operation not permitted/);
+    assert.equal(existsSync(join(cwd, ".git")), true, ".git must remain intact");
+  });
+
   // 4. Network Isolation
   await step("4.1 network: 'deny' blocks outbound HTTP/TCP while workspace ops continue", async () => {
     const netDenyConfig = { ...config, network: "deny" };
@@ -288,11 +450,11 @@ try {
   });
 
   // 5. Process Group & Background Job Reaping
-  await step("5.1 nohup background jobs are reaped and unmount never hangs or fails with Busy", async () => {
+  await step("5.1 nohup background jobs are reaped even if cd / out of workspace (process group kill)", async () => {
     const t0 = Date.now();
     const r = await sA.mutate("reap1", "bash", () =>
       sA.exec(
-        `(nohup sleep 200 >/dev/null 2>&1 &) && sleep 0.1 && echo "spawned bg"`,
+        `(cd /; nohup sleep 200 >/dev/null 2>&1 &) && sleep 0.1 && echo "spawned bg"`,
         cwd,
         { onData: () => {} },
       )
@@ -301,10 +463,10 @@ try {
     const duration = Date.now() - t0;
     assert.ok(duration < 3000, `execution must complete promptly, took ${duration} ms`);
 
-    // Verify background sleep process was killed and workspace was unmounted
+    // Verify background sleep process was killed immediately
     await new Promise((r) => setTimeout(r, 100));
     const sleepPids = pgrep("sleep 200").stdout.trim();
-    assert.equal(sleepPids, "", "background sleep 200 must be killed by reapHolders");
+    assert.equal(sleepPids, "", "background sleep 200 must be killed by process group kill");
   });
 
   await step("5.2 abort and timeout reap process groups cleanly", async () => {

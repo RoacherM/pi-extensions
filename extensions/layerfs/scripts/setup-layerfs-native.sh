@@ -10,6 +10,7 @@ set -euo pipefail
 REF="833acf7b12b206396381c0b5605fe861f7f7d5a0"
 CHERRY_MOUNT="009931c56534d3c173618f00c5ef57e8ce96dc7a"
 CHERRY_APPLEDOUBLE="a700af8f492ef360d150877e5d469031767e473f"
+CHERRY_OVERLAY="c914d14baf99296f64c7e0a2266b66da4f5c7ae8"
 BUNDLE="${HOME}/.cache/epi-layerfs/bundle-native"
 SRC="${HOME}/.cache/epi-layerfs/src-native"
 
@@ -34,14 +35,16 @@ fi
 git -C "${SRC}" sparse-checkout set --no-cone '/core/' '!/core/docs/' '/sdk/js/' '/.cargo/'
 
 for attempt in 1 2 3 4 5; do
-  git -C "${SRC}" fetch --filter=blob:none origin "refs/pull/427/head" "${REF}" "${CHERRY_MOUNT}" "${CHERRY_APPLEDOUBLE}" && git -C "${SRC}" checkout --force --quiet "${REF}" && break
+  git -C "${SRC}" fetch --filter=blob:none origin "refs/pull/427/head" "${REF}" "${CHERRY_MOUNT}" "${CHERRY_APPLEDOUBLE}" "${CHERRY_OVERLAY}" && git -C "${SRC}" checkout --force --quiet "${REF}" && break
   echo "fetch/checkout failed (attempt ${attempt}); retrying in 5 s..." >&2
   sleep 5
   [ "${attempt}" = 5 ] && { echo "could not fetch LayerFS ${REF}; rerun this script to resume" >&2; exit 1; }
 done
 
+git -C "${SRC}" reset --hard "${REF}" && git -C "${SRC}" clean -fd
 git -C "${SRC}" show "${CHERRY_MOUNT}" -- core/ | git -C "${SRC}" apply -
 git -C "${SRC}" show "${CHERRY_APPLEDOUBLE}" -- core/ | git -C "${SRC}" apply -
+git -C "${SRC}" show "${CHERRY_OVERLAY}" -- sdk/js/native/src/direct.rs | git -C "${SRC}" apply -
 
 for f in core/Cargo.lock .cargo/config.toml sdk/js/src/index.js; do
   [ -f "${SRC}/${f}" ] || { echo "LayerFS checkout incomplete: missing ${f}; rerun to resume" >&2; exit 1; }

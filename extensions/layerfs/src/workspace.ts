@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsc, existsSync, mkdtempSync, promises as fsp, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, posix, relative, resolve, basename } from "node:path";
 import { BindingStore, type HostEntry, type HostIndex, type ProjectRecord, type SessionBinding } from "./bindings.ts";
 import type { LayerfsConfig } from "./config.ts";
 import { DockerError, dockerEnv, ok, run } from "./docker.ts";
@@ -26,6 +26,49 @@ export interface OpenOptions {
   reason?: "startup" | "reload" | "new" | "resume" | "fork";
   resumeBinding?: { project?: string; baseBranch?: string; workBranch?: string; baseRef?: string; headCommit?: string | null };
   forkFromRef?: string | null;
+}
+
+export async function assertInsideWorkspace(wsReal: string, targetPath: string, allowFinalSymlink = false): Promise<string> {
+  const allowed = bothSpellings(wsReal);
+  const isInside = (p: string) => allowed.some((w) => p === w || p.startsWith(`${w}/`));
+
+  let real: string;
+  try {
+    if (allowFinalSymlink) {
+      const parent = dirname(targetPath);
+      const realParent = await fsp.realpath(parent);
+      real = join(realParent, basename(targetPath));
+    } else {
+      real = await fsp.realpath(targetPath);
+    }
+  } catch (e: any) {
+    if (e?.code === "ENOENT") {
+      let cur = targetPath;
+      while (cur !== dirname(cur)) {
+        cur = dirname(cur);
+        try {
+          const realCur = await fsp.realpath(cur);
+          if (!isInside(realCur)) {
+            const err = new Error(`path ${targetPath} resolves to ${realCur} which is outside the workspace`);
+            (err as any).code = "EPERM";
+            throw err;
+          }
+          break;
+        } catch (ce: any) {
+          if (ce?.code === "EPERM") throw ce;
+        }
+      }
+      throw e;
+    }
+    throw e;
+  }
+
+  if (!isInside(real)) {
+    const err = new Error(`path ${targetPath} resolves to ${real} which is outside the workspace`);
+    (err as any).code = "EPERM";
+    throw err;
+  }
+  return real;
 }
 
 export class LayerfsError extends Error {
@@ -462,7 +505,11 @@ export class LayerfsSession {
           return { merged: false, branch: this.workBranch, head: this.headCommit, conflicts, lww: 0 };
         }
         if (e?.code === "NoSuchBranch") throw e;
-        return await this.fallbackMergeBranch(resolvedOther, options);
+        const isRecordFailure = /invalid record|binding kind/i.test(String(e?.message ?? "")) || e?.code === "InvalidRecord";
+        if (options?.strategy || options?.resolve || isRecordFailure) {
+          return await this.fallbackMergeBranch(resolvedOther, options);
+        }
+        throw e;
       }
     });
     this.mutex = job.catch(() => {});
@@ -874,11 +921,13 @@ export class LayerfsSession {
     // 4. Check listAllBranches
     const branches = await this.listAllBranches();
     if (branches.some((b) => b.name === trimmed)) {
+      if (sm && sm[2]) {
+        return trimmed;
+      }
       if (sm) {
         const shortId = sm[1];
-        const targetSeq = sm[2] ? parseInt(sm[2], 10) : 0;
         let highestBranch = trimmed;
-        let highestSeq = targetSeq;
+        let highestSeq = 0;
         for (const b of branches) {
           const bm = /^s-([a-f0-9]+)-(\d+)$/.exec(b.name);
           if (bm && bm[1] === shortId) {
@@ -999,6 +1048,12 @@ export class LayerfsSession {
     const sp = this.toStorePath(hostPath);
     if (!sp) throw new Error(`${hostPath} is outside the LayerFS workspace (${this.cwd}); writes there are refused`);
     const rel = sp.replace(/^\/+/, "");
+    const relNorm = rel.toLowerCase();
+    if (relNorm === ".lww" || relNorm === ".git/config" || relNorm === ".git/hooks" || relNorm.startsWith(".git/hooks/")) {
+      const err = new Error(`writes to ${rel} are refused for security`);
+      (err as any).code = "EACCES";
+      throw err;
+    }
     if (rel && isExcludedPath(rel, this.config.excludes)) {
       throw enoent(hostPath, "excluded secret file");
     }
@@ -1076,6 +1131,26 @@ export class LayerfsSession {
     }
     return this.withMountedBranch(branchToMount, false, "read bytes", async (ctr, ident, wsPath) => {
       const p = posix.join(wsPath, storePath.replace(/^\/+/, ""));
+      if (this.isNative) {
+        try {
+          const real = await fsp.realpath(p);
+          const allowed = bothSpellings(wsPath);
+          const isInside = allowed.some((w) => real === w || real.startsWith(`${w}/`));
+          if (!isInside) {
+            if (isOutsideSecret(real, this.config.excludes)) {
+              throw enoent(originalHostPath, "secret file outside the workspace is not readable");
+            }
+            const hostRel = this.toRel(real);
+            if (hostRel && isExcludedPath(hostRel, this.config.excludes)) {
+              throw enoent(originalHostPath, "excluded secret file is not readable");
+            }
+            throw enoent(originalHostPath, "refusing symlink pointing outside the LayerFS workspace");
+          }
+        } catch (e: any) {
+          if (e?.code === "ENOENT") throw enoent(originalHostPath, e.message);
+          throw e;
+        }
+      }
       const r = await this.dexec(ctr, ident, `cat -- "$1"`, [p]);
       if (r.code !== 0) throw enoent(originalHostPath, r.stderr);
       return r.stdout;
@@ -1205,6 +1280,42 @@ export class LayerfsSession {
     const rel = sp.replace(/^\/+/, "");
     await this.withMountedBranch(this.workBranch, true, `pi write [${this.pendingOrigins.join(",") || "write"}]`, async (ctr, ident, wsPath) => {
       const p = posix.join(wsPath, rel);
+      if (this.isNative) {
+        const allowed = bothSpellings(wsPath);
+        const isInside = (target: string) => allowed.some((w) => target === w || target.startsWith(`${w}/`));
+
+        const checkPathInside = async (candidate: string) => {
+          let cur = candidate;
+          while (cur && isInside(cur) && cur !== dirname(cur)) {
+            const lst = await fsp.lstat(cur).catch(() => null);
+            if (lst?.isSymbolicLink()) {
+              const linkTarget = resolve(dirname(cur), await fsp.readlink(cur));
+              const realTarget = await fsp.realpath(linkTarget).catch(() => null);
+              if (realTarget) {
+                if (!isInside(realTarget)) throw new Error("refusing to write through a symlink pointing outside the LayerFS workspace");
+              } else {
+                // Dangling symlink: walk up from linkTarget to its nearest existing ancestor
+                let anc = dirname(linkTarget);
+                while (anc && anc !== dirname(anc)) {
+                  const realAnc = await fsp.realpath(anc).catch(() => null);
+                  if (realAnc) {
+                    if (!isInside(realAnc)) throw new Error("refusing to write through a symlink pointing outside the LayerFS workspace");
+                    break;
+                  }
+                  anc = dirname(anc);
+                }
+              }
+            }
+            const realCur = await fsp.realpath(cur).catch(() => null);
+            if (realCur && !isInside(realCur)) {
+              throw new Error("refusing to write through a symlink pointing outside the LayerFS workspace");
+            }
+            if (allowed.includes(cur)) break;
+            cur = dirname(cur);
+          }
+        };
+        await checkPathInside(p);
+      }
       const r = await this.dexec(ctr, ident, `mkdir -p "$(dirname "$1")" && cat > "$1"`, [p], bytes);
       if (r.code !== 0) throw new Error(`write ${hostPath} failed: ${r.stderr.trim()}`);
     });
@@ -1322,9 +1433,27 @@ export class LayerfsSession {
     return { container, ident };
   }
 
+  private currentNativeWsPath: string | null = null;
+
   private async dexec(container: string, ident: string, script: string, args: string[] = [], input?: Buffer | string) {
     if (this.isNative) {
-      return run("/bin/sh", ["-c", script, "_", ...args], { input, timeoutMs: 120_000 });
+      const scratchDir = join(this.config.root, "scratch", this.projectRecord?.name || "default", this.logicalBranch);
+      await fsp.mkdir(scratchDir, { recursive: true }).catch(() => {});
+      const wsScope = this.currentNativeWsPath || this.boxSpec.localDir!;
+      const profile = buildSeatbeltProfile({
+        wsPath: wsScope,
+        hostCwd: this.cwd,
+        scratchDir,
+        configRoot: this.config.root,
+        excludes: this.config.excludes,
+        outsideSecrets: OUTSIDE_SECRET_PATTERNS,
+        network: "deny",
+      });
+      return run(
+        "/usr/bin/sandbox-exec",
+        ["-p", profile, "/bin/sh", "-c", script, "_", ...args],
+        { input, timeoutMs: 120_000 },
+      );
     }
     const r = await run(
       this.config.docker,
@@ -1351,6 +1480,8 @@ export class LayerfsSession {
     const ws = await this.lfs.workspace.mount(branch);
     const { container, ident } = await this.containerAndIdent(ws);
     const wsPath = this.isNative ? (await fsp.realpath(ws.path).catch(() => ws.path)) : ws.path;
+    const prevWsPath = this.currentNativeWsPath;
+    if (this.isNative) this.currentNativeWsPath = wsPath;
     let keepMounted = false;
     try {
       const value = await fn(container, ident, wsPath, ws);
@@ -1375,6 +1506,7 @@ export class LayerfsSession {
         await this.reapHolders(container, ident, wsPath).catch(() => {});
         await this.lfs.workspace.unmount(ws, !commitAfter).catch(() => {});
       }
+      if (this.isNative) this.currentNativeWsPath = prevWsPath;
     }
   }
 
@@ -1411,7 +1543,15 @@ export class LayerfsSession {
           const full = join(wsReal, p);
           try {
             const now = new Date();
-            await fsp.utimes(full, now, now).catch(() => {});
+            if (typeof fsp.lutimes === "function") {
+              await fsp.lutimes(full, now, now).catch(() => {});
+            } else {
+              const real = await fsp.realpath(full).catch(() => null);
+              const allowed = bothSpellings(wsReal);
+              if (real && allowed.some((w) => real === w || real.startsWith(`${w}/`))) {
+                await fsp.utimes(full, now, now).catch(() => {});
+              }
+            }
           } catch {}
         }
       }
@@ -1428,6 +1568,7 @@ export class LayerfsSession {
         wsPath: wsReal,
         hostCwd: this.cwd,
         scratchDir,
+        configRoot: this.config.root,
         excludes: this.config.excludes,
         outsideSecrets: OUTSIDE_SECRET_PATTERNS,
         network: this.config.network,
@@ -1479,6 +1620,10 @@ export class LayerfsSession {
           throw killFailed;
         }
 
+        if (child.pid) {
+          try { process.kill(-child.pid, "SIGKILL"); } catch {}
+        }
+
         await this.reapHolders("native", "", wsReal).catch(() => {});
 
         const lwwFile = join(wsReal, ".lww");
@@ -1504,6 +1649,9 @@ export class LayerfsSession {
         this.activeSids.delete(tag);
         if (!keepMounted) {
           const u = (async () => {
+            if (child.pid) {
+              try { process.kill(-child.pid, "SIGKILL"); } catch {}
+            }
             await this.reapHolders("native", "", wsReal).catch(() => {});
             await this.lfs.workspace.unmount(ws).catch(() => {});
           })();
@@ -1680,11 +1828,24 @@ export class LayerfsSession {
   }
 
   private async prepareNativeGit(wsReal: string): Promise<void> {
-    const hasGit = await fsp.access(join(wsReal, ".git")).then(() => true, () => false);
-    if (!hasGit) return;
-    const infoDir = join(wsReal, ".git", "info");
+    const gitDir = join(wsReal, ".git");
+    const gitStat = await fsp.lstat(gitDir).catch(() => null);
+    if (!gitStat || !gitStat.isDirectory() || gitStat.isSymbolicLink()) return;
+    const allowed = bothSpellings(wsReal);
+    const isInside = (target: string) => allowed.some((w) => target === w || target.startsWith(`${w}/`));
+    const realGit = await fsp.realpath(gitDir).catch(() => null);
+    if (!realGit || !isInside(realGit)) return;
+
+    const infoDir = join(gitDir, "info");
+    const infoStat = await fsp.lstat(infoDir).catch(() => null);
+    if (infoStat && (!infoStat.isDirectory() || infoStat.isSymbolicLink())) return;
     await fsp.mkdir(infoDir, { recursive: true });
+    const realInfo = await fsp.realpath(infoDir).catch(() => null);
+    if (!realInfo || !isInside(realInfo)) return;
+
     const excludePath = join(infoDir, "exclude");
+    const exStat = await fsp.lstat(excludePath).catch(() => null);
+    if (exStat && exStat.isSymbolicLink()) return;
     const existing = await fsp.readFile(excludePath, "utf8").catch(() => "");
     if (!existing.split("\n").includes("/.lww")) {
       await fsp.appendFile(excludePath, (existing.length && !existing.endsWith("\n") ? "\n" : "") + "/.lww\n").catch(() => {});
@@ -1692,7 +1853,8 @@ export class LayerfsSession {
     if (this.config.excludes.length > 0) {
       const excludesFlat = this.config.excludes.flatMap(expandBraces).filter(Boolean);
       const excludeArgs = excludesFlat.flatMap((pat) => [`:(glob,icase)${pat}`, `:(glob,icase)**/${pat}`]);
-      const ls = await run("git", ["-C", wsReal, "-c", "core.quotePath=false", "ls-files", "-v", "--", ...excludeArgs], { timeoutMs: 10_000 }).catch(() => null);
+      const gitEnv = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+      const ls = await run("git", ["-C", wsReal, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.quotePath=false", "ls-files", "-v", "--", ...excludeArgs], { env: gitEnv, timeoutMs: 10_000 }).catch(() => null);
       if (ls?.code === 0 && ls.stdout.length > 0) {
         const lines = ls.stdout.toString().split("\n");
         const skipFiles: string[] = [];
@@ -1706,7 +1868,7 @@ export class LayerfsSession {
           }
         }
         if (skipFiles.length > 0) {
-          await run("git", ["-C", wsReal, "update-index", "--skip-worktree", "--", ...skipFiles], { timeoutMs: 10_000 }).catch(() => null);
+          await run("git", ["-C", wsReal, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "update-index", "--skip-worktree", "--", ...skipFiles], { env: gitEnv, timeoutMs: 10_000 }).catch(() => null);
         }
       }
     }

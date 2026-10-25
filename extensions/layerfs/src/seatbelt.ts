@@ -6,6 +6,7 @@ export interface SeatbeltOptions {
   wsPath: string;
   hostCwd: string;
   scratchDir: string;
+  configRoot?: string;
   excludes: string[];
   outsideSecrets: string[];
   network: "allow" | "localhost" | "deny";
@@ -57,7 +58,7 @@ export function expandBraces(pattern: string): string[] {
  * macOS Seatbelt regex does not support (?i) prefix, so letters are emitted as [aA] character
  * classes to ensure case-insensitivity at the kernel level.
  */
-export function globToSbplRegex(glob: string, base: string): string | null {
+export function globToSbplRegex(glob: string, base?: string): string | null {
   const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   let pat = glob.trim();
@@ -70,7 +71,15 @@ export function globToSbplRegex(glob: string, base: string): string | null {
   let rx = "";
   for (let i = 0; i < pat.length; i++) {
     const c = pat[i];
-    if (c === "*") {
+    if (c === "*" && pat[i + 1] === "*") {
+      if (pat[i + 2] === "/") {
+        rx += "(.*/)?";
+        i += 2;
+      } else {
+        rx += ".*";
+        i += 1;
+      }
+    } else if (c === "*") {
       rx += "[^/]*";
     } else if (c === "?") {
       rx += "[^/]";
@@ -83,12 +92,15 @@ export function globToSbplRegex(glob: string, base: string): string | null {
     }
   }
 
-  const baseRx = esc(base);
-  if (anchored) {
-    return `^${baseRx}/${rx}($|/.*)`;
-  } else {
-    return `^${baseRx}/(.*/)?${rx}($|/.*)`;
+  if (base !== undefined) {
+    const baseRx = esc(base);
+    if (anchored) {
+      return `^${baseRx}/${rx}($|/.*)`;
+    } else {
+      return `^${baseRx}/(.*/)?${rx}($|/.*)`;
+    }
   }
+  return rx;
 }
 
 function escapeLiteral(s: string): string {
@@ -110,21 +122,38 @@ function escapeLiteral(s: string): string {
  *    directory metadata traversal allowed.
  */
 export function buildSeatbeltProfile(options: SeatbeltOptions): string {
-  const { wsPath, hostCwd, scratchDir, excludes, outsideSecrets, network, logTag } = options;
+  const { wsPath, hostCwd, scratchDir, configRoot, excludes, outsideSecrets, network, logTag } = options;
 
   const wsSpellings = bothSpellings(wsPath);
   const hostSpellings = bothSpellings(hostCwd);
   const scratchSpellings = bothSpellings(scratchDir);
   const homeSpellings = bothSpellings(homedir());
+  const configSpellings = configRoot ? bothSpellings(configRoot) : [];
+
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   const lines: string[] = [
     "(version 1)",
     logTag ? `;; Log tag: ${logTag}` : ";; Claude Code (srt)-style macOS Seatbelt Sandbox Policy",
+    // 1. allow default
     "(allow default)",
     "",
   ];
 
-  // 3. Network Isolation
+  // Process Execution & Mount Syscall Lockdown (deny file-mount/file-unmount and mount binaries)
+  lines.push(
+    ";; --- Process Execution & Mount Syscall Lockdown ---",
+    "(deny file-mount)",
+    "(deny file-unmount)",
+    "(deny process-exec",
+    '  (literal "/sbin/mount_nfs")',
+    '  (literal "/sbin/umount")',
+    '  (literal "/usr/sbin/diskutil")',
+    ")",
+    "",
+  );
+
+  // Network Isolation
   lines.push(";; --- Network Isolation ---");
   if (network === "deny") {
     lines.push("(deny network-outbound)");
@@ -136,14 +165,29 @@ export function buildSeatbeltProfile(options: SeatbeltOptions): string {
   }
   lines.push("");
 
+  // 2. If configRoot: (deny file-read* file-write* (subpath configRoot))
+  if (configSpellings.length > 0) {
+    lines.push(";; 2. Deny read & write on configRoot");
+    const denies = configSpellings.map((r) => `  (subpath "${escapeLiteral(r)}")`);
+    lines.push(`(deny file-read* file-write*\n${denies.join("\n")}\n)`);
+  }
+
+  // 3. (allow file-read* (subpath wsPath) (subpath scratchDir))
+  if (configSpellings.length > 0) {
+    lines.push(";; 3. Re-allow file-read* for wsPath and scratchDir inside configRoot");
+    const readAllows: string[] = [];
+    for (const w of wsSpellings) readAllows.push(`  (subpath "${escapeLiteral(w)}")`);
+    for (const s of scratchSpellings) readAllows.push(`  (subpath "${escapeLiteral(s)}")`);
+    lines.push(`(allow file-read*\n${readAllows.join("\n")}\n)`);
+  }
+
   // 4. Filesystem Write Lockdown
-  lines.push(";; --- Filesystem Write Lockdown ---");
+  lines.push(";; 4. Deny all file writes");
   lines.push("(deny file-write*)");
 
-  const writeAllows: string[] = [];
-  for (const w of wsSpellings) writeAllows.push(`  (subpath "${escapeLiteral(w)}")`);
-  for (const s of scratchSpellings) writeAllows.push(`  (subpath "${escapeLiteral(s)}")`);
-  writeAllows.push(
+  // 5. Allow standard write paths (/tmp, /var/folders, /dev/...)
+  lines.push(";; 5. Allow standard temporary & device write paths");
+  const stdWriteAllows = [
     '  (subpath "/private/tmp")',
     '  (subpath "/tmp")',
     '  (subpath "/private/var/folders")',
@@ -154,46 +198,85 @@ export function buildSeatbeltProfile(options: SeatbeltOptions): string {
     '  (literal "/dev/dtracehelper")',
     '  (literal "/dev/urandom")',
     '  (literal "/dev/random")',
-  );
-  lines.push(`(allow file-write*\n${writeAllows.join("\n")}\n)`);
+  ];
+  lines.push(`(allow file-write*\n${stdWriteAllows.join("\n")}\n)`);
 
-  // Mandatory write denies:
-  lines.push(";; Mandatory write denies (last-match-wins over allow)");
-
-  // 4a. Protect user's real project folder on the host
-  const wsInsideHost = wsSpellings.some((w) => hostSpellings.some((h) => w.startsWith(`${h}/`)));
-  if (!wsInsideHost) {
+  // 6. If hostCwd !== "/": (deny file-write* (subpath hostCwd)) unconditionally!
+  if (hostCwd !== "/") {
+    lines.push(";; 6. Protect host cwd unconditionally against writes");
     const hostDenies = hostSpellings.map((h) => `  (subpath "${escapeLiteral(h)}")`);
     lines.push(`(deny file-write*\n${hostDenies.join("\n")}\n)`);
   }
 
-  // 4b. Protect .lww and .git/hooks inside wsPath
-  const hookLwwDenies: string[] = [];
-  for (const w of wsSpellings) {
-    hookLwwDenies.push(`  (literal "${escapeLiteral(join(w, ".lww"))}")`);
-    hookLwwDenies.push(`  (subpath "${escapeLiteral(join(w, ".git", "hooks"))}")`);
+  // 7. If configRoot: (deny file-write* (subpath configRoot))
+  if (configSpellings.length > 0) {
+    lines.push(";; 7. Protect configRoot against writes");
+    const configDenies = configSpellings.map((r) => `  (subpath "${escapeLiteral(r)}")`);
+    lines.push(`(deny file-write*\n${configDenies.join("\n")}\n)`);
   }
-  lines.push(`(deny file-write*\n${hookLwwDenies.join("\n")}\n)`);
 
-  // 4c. Deny writing or unlinking excludes in workspace
+  // 8. (allow file-write* (subpath wsPath) (subpath scratchDir))
+  lines.push(";; 8. Re-allow writes to wsPath and scratchDir");
+  const wsScratchAllows: string[] = [];
+  for (const w of wsSpellings) wsScratchAllows.push(`  (subpath "${escapeLiteral(w)}")`);
+  for (const s of scratchSpellings) wsScratchAllows.push(`  (subpath "${escapeLiteral(s)}")`);
+  lines.push(`(allow file-write*\n${wsScratchAllows.join("\n")}\n)`);
+
+  // 9. Mandatory write denies inside wsPath: .lww, .git/hooks, .git/config, excludes, plus file-write-unlink on .git!
+  lines.push(";; 9. Mandatory write denies inside wsPath");
+  const hookLwwDenies: string[] = [];
+  const hookLwwUnlinkDenies: string[] = [];
+  for (const w of wsSpellings) {
+    hookLwwDenies.push(
+      `  (literal "${escapeLiteral(join(w, ".lww"))}")`,
+      `  (subpath "${escapeLiteral(join(w, ".git", "hooks"))}")`,
+      `  (literal "${escapeLiteral(join(w, ".git", "config"))}")`,
+    );
+    hookLwwUnlinkDenies.push(
+      `  (literal "${escapeLiteral(join(w, ".git"))}")`,
+      `  (literal "${escapeLiteral(join(w, ".git", "hooks"))}")`,
+      `  (literal "${escapeLiteral(join(w, ".git", "config"))}")`,
+      `  (literal "${escapeLiteral(join(w, ".git", "info"))}")`,
+      `  (literal "${escapeLiteral(join(w, ".git", "info", "exclude"))}")`,
+      `  (literal "${escapeLiteral(join(w, ".lww"))}")`,
+    );
+  }
+  lines.push(
+    `(deny file-write*\n${hookLwwDenies.join("\n")}\n)`,
+    `(deny file-write-unlink\n${hookLwwUnlinkDenies.join("\n")}\n)`,
+  );
+
+  // 9b. Excludes inside wsPath: deny writing or unlinking
   const flatExcludes = excludes.flatMap(expandBraces).filter(Boolean);
   const wsExcludeRegexes: string[] = [];
+  const wsUnlinkRegexes: string[] = [];
   for (const w of wsSpellings) {
-    for (const pat of flatExcludes) {
-      const rx = globToSbplRegex(pat, w);
-      if (rx) wsExcludeRegexes.push(`  (regex #"${rx}")`);
+    const escW = esc(w);
+    for (const rawPat of flatExcludes) {
+      const dirOnly = rawPat.trim().endsWith("/");
+      const pat = rawPat.trim().replace(/\/+$/, "");
+      const anchored = pat.startsWith("/") || pat.includes("/");
+      const rx = globToSbplRegex(pat);
+      if (rx) {
+        const fullRx = anchored ? `^${escW}/${rx}($|/.*)` : `^${escW}/(.*/)?${rx}($|/.*)`;
+        wsExcludeRegexes.push(`  (regex #"${fullRx}")`);
+        if (dirOnly) {
+          const dirRx = anchored ? `^${escW}/${rx}$` : `^${escW}/(.*/)?${rx}$`;
+          wsUnlinkRegexes.push(`  (regex #"${dirRx}")`);
+        }
+      }
     }
   }
   if (wsExcludeRegexes.length > 0) {
     lines.push(
       `(deny file-write*\n${wsExcludeRegexes.join("\n")}\n)`,
-      `(deny file-write-unlink\n${wsExcludeRegexes.join("\n")}\n)`,
+      `(deny file-write-unlink\n${[...wsExcludeRegexes, ...wsUnlinkRegexes].join("\n")}\n)`,
     );
   }
   lines.push("");
 
-  // 5. Filesystem Read Denies & Move-Blocking
-  lines.push(";; --- Filesystem Read Denies & Move-Blocking ---");
+  // 10. Read denies (deny file-read-data and deny file-write-unlink)
+  lines.push(";; 10. Filesystem Read Denies & Move-Blocking ---");
 
   // Outside secrets under $HOME
   const homeSecretDenies: string[] = [];
@@ -208,13 +291,50 @@ export function buildSeatbeltProfile(options: SeatbeltOptions): string {
   // Excludes under hostCwd and wsPath
   const allSecretRegexes: string[] = [];
   for (const base of [...new Set([...hostSpellings, ...wsSpellings])]) {
-    for (const pat of flatExcludes) {
-      const rx = globToSbplRegex(pat, base);
-      if (rx) allSecretRegexes.push(`  (regex #"${rx}")`);
+    const escBase = esc(base);
+    for (const rawPat of flatExcludes) {
+      const dirOnly = rawPat.trim().endsWith("/");
+      const pat = rawPat.trim().replace(/\/+$/, "");
+      const anchored = pat.startsWith("/") || pat.includes("/");
+      const rx = globToSbplRegex(pat);
+      if (rx) {
+        const fullRx = anchored ? `^${escBase}/${rx}($|/.*)` : `^${escBase}/(.*/)?${rx}($|/.*)`;
+        allSecretRegexes.push(`  (regex #"${fullRx}")`);
+        if (dirOnly) {
+          const dirRx = anchored ? `^${escBase}/${rx}$` : `^${escBase}/(.*/)?${rx}$`;
+          allSecretRegexes.push(`  (regex #"${dirRx}")`);
+        }
+      }
     }
   }
 
-  const allReadDenies = [...homeSecretDenies, ...allSecretRegexes];
+  // Global unanchored exclude patterns (e.g. .env, *.pem, *.key), carving out system CA certificate roots
+  // so HTTPS tools (curl, git, pip, cargo) can still read /private/etc/ssl/cert.pem, Homebrew openssl certs, and certifi.
+  const caCarveOut = [
+    '(require-not (subpath "/private/etc"))',
+    '(require-not (subpath "/etc"))',
+    '(require-not (subpath "/System"))',
+    '(require-not (subpath "/usr"))',
+    '(require-not (subpath "/Library"))',
+    '(require-not (subpath "/opt/homebrew"))',
+    '(require-not (regex #"/certifi/cacert\\.[pP][eE][mM]$"))',
+  ].join(" ");
+  const globalUnanchoredRegexes: string[] = [];
+  for (const rawPat of flatExcludes) {
+    const dirOnly = rawPat.trim().endsWith("/");
+    const pat = rawPat.trim().replace(/\/+$/, "");
+    if (pat && !pat.includes("/") && !pat.startsWith("/")) {
+      const rx = globToSbplRegex(pat);
+      if (rx) {
+        globalUnanchoredRegexes.push(`  (require-all (regex #"^/(.*/)?${rx}($|/.*)") ${caCarveOut})`);
+        if (dirOnly) {
+          globalUnanchoredRegexes.push(`  (require-all (regex #"^/(.*/)?${rx}$") ${caCarveOut})`);
+        }
+      }
+    }
+  }
+
+  const allReadDenies = [...homeSecretDenies, ...allSecretRegexes, ...globalUnanchoredRegexes];
   if (allReadDenies.length > 0) {
     lines.push(
       `(deny file-read-data\n${allReadDenies.join("\n")}\n)`,

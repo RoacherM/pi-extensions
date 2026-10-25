@@ -61,8 +61,11 @@ export async function ensureStoreBox(config: LayerfsConfig, imageId: string): Pr
     process.env.LAYERFS_NATIVE = join(config.bundle, "layerfs.node");
     process.env.LAYERFS_BUNDLE = config.bundle;
     process.env.LAYERFS_SANDBOX = "native";
+    if (config.nfsMount) process.env.LAYERFS_NFS_MOUNT = config.nfsMount;
     return spec;
   }
+  delete process.env.LAYERFS_SANDBOX;
+  delete process.env.LAYERFS_NFS_MOUNT;
   process.env.LAYERFS_NATIVE = BINDING_PATH;
   process.env.LAYERFS_BUNDLE = spec.bundle;
   process.env.LAYERFS_STORE_CONTAINER = spec.box;
