@@ -27,13 +27,14 @@ const PREFIX = `pi-lfs-pt-${id}-`;
 process.env.PI_LAYERFS_ROOT = join(base, "lfs");
 process.env.PI_LAYERFS_PREFIX = PREFIX;
 process.env.PI_LAYERFS_KILL_GRACE_MS = "1000";
-process.env.PI_LAYERFS_BUNDLE ??= join(REAL_HOME, ".cache/epi-layerfs/bundle-5fb68dd");
+process.env.PI_LAYERFS_BUNDLE ??= join(REAL_HOME, ".cache/epi-layerfs/bundle-native");
 
 const { fauxAssistantMessage, fauxText, fauxToolCall, createFauxCore } = await import("@earendil-works/pi-ai");
 const { createAgentSessionServices, createAgentSessionFromServices, resolveCliModel, SessionManager, SettingsManager } = await import("@earendil-works/pi-coding-agent");
 const { default: layerfs, CHECKPOINT_ENTRY } = await import("../src/index.ts");
+const { stopNativeDaemons } = await import("../src/workspace.ts");
 
-const docker = (...a) => spawnSync("docker", a, { encoding: "utf8" });
+const pgrep = (pattern) => spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
 const results = [];
 const step = async (name, fn) => {
   const t0 = Date.now();
@@ -114,8 +115,8 @@ try {
     const [r] = await run([["read", { path: "README.md" }]]);
     assert.match(text(r), /original readme/);
     writeFileSync(join(cwd, "README.md"), "original readme\n");
-    const sb = docker("ps", "-q", "--filter", `name=^${PREFIX}`, "--filter", "label=layerfs.role=sandbox").stdout.trim();
-    assert.equal(sb, "", "Store-direct read must not start a Sandbox");
+    const daemons = pgrep(`layerfs-daemon --config ${join(process.env.PI_LAYERFS_ROOT, "local")}/`).stdout.trim();
+    assert.equal(daemons, "", "Store-direct read must not start a daemon");
   });
 
   await step(".env is not visible in the workspace", async () => {
@@ -143,11 +144,11 @@ try {
     assert.doesNotMatch(readFileSync(join(cwd, "src/math.js"), "utf8"), /\+ 0/);
   });
 
-  await step("bash streams updates, runs in Linux, commits, and unmounts immediately", async () => {
+  await step("bash streams updates, runs in native OS, commits, and unmounts immediately", async () => {
     main.updates.length = 0;
     const [r] = await run([["bash", { command: "uname -s; for i in 1 2 3; do echo step$i; sleep 0.35; done; echo generated > gen.txt" }]]);
     assert.equal(r.isError, false, text(r));
-    assert.match(text(r), /Linux[\s\S]*step3/);
+    assert.match(text(r), /(?:Darwin|Linux)[\s\S]*step3/);
     assert.ok(main.updates.length >= 2, `expected streaming updates, got ${main.updates.length}`);
     assert.equal(existsSync(join(cwd, "gen.txt")), false);
     assert.equal(main.checkpoints().at(-1).data.origins[0], r.toolCallId);
@@ -162,11 +163,11 @@ try {
   });
 
   await step("user ! command routes into the Branch and checkpoints", async () => {
-    const routed = await session.extensionRunner.emitUserBash({ type: "user_bash", command: "echo user > user.txt && pwd", cwd, excludeFromContext: false });
+    const routed = await session.extensionRunner.emitUserBash({ type: "user_bash", command: "echo user > user.txt && cat user.txt", cwd, excludeFromContext: false });
     assert.ok(routed?.operations, "user_bash must be routed");
-    const out = await session.executeBash("echo user > user.txt && pwd", undefined, { operations: routed.operations });
-    assert.equal(out.output.trim().split("\n").at(-1), cwd, "commands see the Branch at the host path");
-    assert.equal(existsSync(join(cwd, "user.txt")), false);
+    const out = await session.executeBash("echo user > user.txt && cat user.txt", undefined, { operations: routed.operations });
+    assert.equal(out.output.trim(), "user", "command routes into branch");
+    assert.equal(existsSync(join(cwd, "user.txt")), false, "user.txt not on host");
     assert.ok(main.checkpoints().some((c) => c.data.origins.includes("user_bash")));
   });
 
@@ -176,10 +177,8 @@ try {
     await session.abort();
     await p;
     await new Promise((r) => setTimeout(r, 300));
-    const ctr = docker("ps", "--filter", `name=^${PREFIX}`, "--filter", "label=layerfs.role=sandbox", "--format", "{{.Names}}").stdout.trim().split("\n")[0];
-    if (ctr) {
-      assert.equal(docker("exec", ctr, "sh", "-c", "pgrep -u 501 -f 'sleep 300' || true").stdout.trim(), "");
-    }
+    const left = pgrep("sleep 300").stdout.trim();
+    assert.equal(left, "", "no lingering sleep process");
   });
 
   await step("parallel tool calls in one turn are serialized, each checkpointed", async () => {
@@ -230,22 +229,19 @@ try {
     return `both sessions applied cleanly`;
   });
 
-  await step("Store container self-heals when stopped mid-session", async () => {
-    docker("stop", "-t", "1", `${PREFIX}store`);
-    // The first call triggers onUnreachable self-heal; wait briefly and verify next call succeeds
-    await run([["read", { path: "README.md" }]]).catch(() => {});
-    for (let i = 0; i < 30; i++) {
-      const state = docker("inspect", "-f", "{{.State.Running}}", `${PREFIX}store`).stdout.trim();
-      if (state === "true") break;
-      await new Promise((r) => setTimeout(r, 100));
+  await step("Sandbox daemon self-heals when stopped mid-session", async () => {
+    const daemonPids = pgrep(`layerfs-daemon --config ${join(process.env.PI_LAYERFS_ROOT, "local")}/`).stdout.trim().split(/\s+/).filter(Boolean);
+    for (const pid of daemonPids) {
+      try { process.kill(Number(pid), "SIGTERM"); } catch {}
     }
-    const [rAfter] = await run([["read", { path: "README.md" }]]);
+    await new Promise((r) => setTimeout(r, 200));
+    const [rAfter] = await run([["bash", { command: "echo healed" }]]);
     assert.equal(rAfter.isError, false, text(rAfter));
-    assert.match(text(rAfter), /original readme/);
+    assert.match(text(rAfter), /healed/);
   });
 
   await step("fail-closed: broken LayerFS -> tools error, host never written", async () => {
-    process.env.PI_LAYERFS_IMAGE = "pi-lfs-missing:none";
+    process.env.PI_LAYERFS_BUNDLE = "/tmp/nonexistent-bundle";
     const bad = await makeSession();
     try {
       const [r, w] = await bad.run([["read", { path: "README.md" }], ["write", { path: "fallback.txt", content: "x" }]]);
@@ -254,7 +250,7 @@ try {
       assert.equal(w.isError, true);
       assert.equal(existsSync(join(cwd, "fallback.txt")), false);
       return text(r).slice(0, 120);
-    } finally { delete process.env.PI_LAYERFS_IMAGE; await bad.shutdown(); }
+    } finally { delete process.env.PI_LAYERFS_BUNDLE; await bad.shutdown(); }
   });
 
   await step("explicit opt-out PI_LAYERFS=0 uses the host folder", async () => {
@@ -268,12 +264,9 @@ try {
 } finally {
   await main?.shutdown().catch(() => {});
   await peer?.shutdown().catch(() => {});
-  const left = docker("ps", "-aq", "--filter", `name=^${PREFIX}`).stdout.trim().split("\n").filter(Boolean);
-  if (left.length) docker("rm", "-f", ...left);
-  const vols = docker("volume", "ls", "-q", "--filter", `name=^${PREFIX}`).stdout.trim().split("\n").filter(Boolean);
-  if (vols.length) docker("volume", "rm", ...vols);
+  await stopNativeDaemons(join(process.env.PI_LAYERFS_ROOT, "local")).catch(() => {});
   const failed = results.filter((r) => !r.ok);
-  console.log(`\n${results.length - failed.length}/${results.length} passed; cleaned ${left.length} containers, ${vols.length} volumes`);
+  console.log(`\n${results.length - failed.length}/${results.length} passed (zero Docker)`);
   rmSync(base, { recursive: true, force: true });
   process.exit(failed.length ? 1 : 0);
 }

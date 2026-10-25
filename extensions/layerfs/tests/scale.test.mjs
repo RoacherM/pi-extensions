@@ -8,7 +8,7 @@ import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { resolveConfig } from "../src/config.ts";
-import { LayerfsSession } from "../src/workspace.ts";
+import { LayerfsSession, stopNativeDaemons } from "../src/workspace.ts";
 
 const source = process.argv[2] ?? join(homedir(), "Projects/sides/epi");
 const id = Date.now().toString(36);
@@ -18,7 +18,7 @@ mkdirSync(base, { recursive: true });
 const clone = spawnSync("cp", ["-c", "-R", source, cwd], { encoding: "utf8" });
 assert.equal(clone.status, 0, clone.stderr);
 const prefix = `pi-lfs-sc-${id}-`;
-const docker = (...a) => spawnSync("docker", a, { encoding: "utf8" });
+const pgrep = (pattern) => spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
 const timings = {};
 const time = async (k, fn) => { const t0 = Date.now(); const v = await fn(); timings[k] = Date.now() - t0; return v; };
 
@@ -42,8 +42,8 @@ try {
   const w = await time("5_store_write_and_checkpoint", () => s1.mutate("w1", "write", () => s1.writeFile(join(cwd, "README.md"), before + "\nlayerfs v0.2 scale test\n")));
   assert.ok(w.checkpoint?.commit);
 
-  const sandboxesBeforeBash = docker("ps", "-q", "--filter", `name=^${prefix}`, "--filter", "label=layerfs.role=sandbox").stdout.trim();
-  assert.equal(sandboxesBeforeBash, "", "all Store ops on 23k-file repo must run with 0 Sandboxes");
+  const daemonsBeforeBash = pgrep(`layerfs-daemon --config ${s1.spec.localDir}/`).stdout.trim();
+  assert.equal(daemonsBeforeBash, "", "all Store ops on 23k-file repo must run with 0 daemons");
 
   const b = await time("6_on_demand_bash_find_wc", () => s1.mutate("b1", "bash", () => s1.exec(`find src -name '*.ts' | xargs wc -l | tail -1 > loc.txt`, cwd, { onData: () => {} })));
   assert.equal(b.value.exitCode, 0);
@@ -66,13 +66,10 @@ try {
 } catch (e) {
   console.log("ERROR", e.stack?.split("\n").slice(0, 6).join("\n"), "\ntimings so far", JSON.stringify(timings));
 } finally {
-  await s1.close().catch(() => {});
-  await s2.close().catch(() => {});
-  const left = docker("ps", "-aq", "--filter", `name=^${prefix}`).stdout.trim().split("\n").filter(Boolean);
-  if (left.length) docker("rm", "-f", ...left);
-  const vols = docker("volume", "ls", "-q", "--filter", `name=^${prefix}`).stdout.trim().split("\n").filter(Boolean);
-  if (vols.length) docker("volume", "rm", ...vols);
+  await s1.close({ stopDaemons: true }).catch(() => {});
+  await s2.close({ stopDaemons: true }).catch(() => {});
+  await stopNativeDaemons(join(base, "lfs/local")).catch(() => {});
   rmSync(base, { recursive: true, force: true });
-  console.log(`${ok ? "PASS" : "FAIL"} scale; cleaned ${left.length} containers, ${vols.length} volumes`);
+  console.log(`${ok ? "PASS" : "FAIL"} scale (zero Docker)`);
   process.exit(ok ? 0 : 1);
 }

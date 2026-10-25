@@ -1,4 +1,4 @@
-// v0.2 Real LayerFS backend + Opus 5.5 P0/P1 regression test suite (no Pi, no model).
+// v0.2 Real LayerFS backend + Opus 5.5 P0/P1 regression test suite (macOS Native, zero Docker).
 // Run: node tests/backend.test.mjs
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -7,7 +7,7 @@ import { chmodSync, existsSync, promises as fsp, lstatSync, mkdirSync, readFileS
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { resolveConfig } from "../src/config.ts";
-import { LayerfsSession } from "../src/workspace.ts";
+import { LayerfsSession, stopNativeDaemons } from "../src/workspace.ts";
 import { formatHistory, loadHistory, parseMessage } from "../src/history.ts";
 
 const id = Date.now().toString(36);
@@ -24,7 +24,7 @@ const step = async (name, fn) => {
     console.log(`FAIL ${name}: ${e.stack?.split("\n").slice(0, 4).join(" | ")}`);
   }
 };
-const docker = (...a) => spawnSync("docker", a, { encoding: "utf8" });
+const pgrep = (pattern) => spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
 const sha = (b) => createHash("sha256").update(b).digest("hex");
 const config = { ...resolveConfig({}), root: join(base, "root"), prefix: `pi-lfs-v2-${id}-`, killGraceMs: 1000 };
 
@@ -60,18 +60,17 @@ writeFileSync(outside, "outside-host\n");
 let sA, sB, sC;
 
 try {
-  await step("preflight refuses missing image (no resources created)", async () => {
-    const bad = { ...config, image: "pi-lfs-does-not-exist:none" };
-    await assert.rejects(new LayerfsSession(cwd, "bad", bad).open(), (e) => e.code === "Preflight" && /not found/.test(e.message));
-    assert.equal(docker("ps", "-aq", "--filter", `name=^${config.prefix}`).stdout.trim(), "");
+  await step("preflight refuses missing bundle (no resources created)", async () => {
+    const bad = { ...config, bundle: "/tmp/non-existent-bundle" };
+    await assert.rejects(new LayerfsSession(cwd, "bad", bad).open(), (e) => e.code === "Preflight" && /missing/.test(e.message));
   });
 
   await step("open session A: initializes shared Project Store; 0 Sandboxes started", async () => {
     sA = new LayerfsSession(cwd, `sessA-${id}`, config, (m) => console.log(`  [sA] ${m}`));
     await sA.open();
-    const sandboxes = docker("ps", "-q", "--filter", `name=^${config.prefix}`, "--filter", "label=layerfs.role=sandbox").stdout.trim();
-    assert.equal(sandboxes, "", "Store init + branch.fork must not start any Sandbox container");
-    return `project=${sA.project} work=${sA.workBranch} base=${sA.baseBranch} sandboxes=0`;
+    const daemons = pgrep(`layerfs-daemon --config ${sA.spec.localDir}/`).stdout.trim();
+    assert.equal(daemons, "", "Store init + branch.fork must not start any daemon");
+    return `project=${sA.project} work=${sA.workBranch} base=${sA.baseBranch} daemons=0`;
   });
 
   await step("Store-direct reads/ls/find/literal-grep run with 0 Sandboxes", async () => {
@@ -89,8 +88,8 @@ try {
     const g = await sA.grepWorkspace({ pattern: "export const a", path: "." });
     assert.deepEqual(g.lines, ["src/app.js:1: export const a = 1;"]);
 
-    const sandboxes = docker("ps", "-q", "--filter", `name=^${config.prefix}`, "--filter", "label=layerfs.role=sandbox").stdout.trim();
-    assert.equal(sandboxes, "", "pure Store reads/ls/find/grep must still have 0 Sandboxes");
+    const daemons = pgrep(`layerfs-daemon --config ${sA.spec.localDir}/`).stdout.trim();
+    assert.equal(daemons, "", "pure Store reads/ls/find/grep must still have 0 daemons");
   });
 
   await step("Store-direct write (incl. nested mkdir) commits in ms with 0 Sandboxes", async () => {
@@ -102,8 +101,8 @@ try {
     const noop = await sA.mutate("t2", "write", () => sA.writeFile(join(cwd, "nested/dir/note.txt"), "from store write\n"));
     assert.equal(noop.checkpoint, null, "unchanged write must return UpToDate and make no Commit");
 
-    const sandboxes = docker("ps", "-q", "--filter", `name=^${config.prefix}`, "--filter", "label=layerfs.role=sandbox").stdout.trim();
-    assert.equal(sandboxes, "", "Store writes must not start a Sandbox");
+    const daemons = pgrep(`layerfs-daemon --config ${sA.spec.localDir}/`).stdout.trim();
+    assert.equal(daemons, "", "Store writes must not start a daemon");
     return `commit=${r.checkpoint.commit.slice(0, 12)}`;
   });
 
@@ -138,7 +137,7 @@ try {
     const t0 = Date.now();
     const r = await sA.mutate("t5", "bash", () =>
       sA.exec(
-        `for i in 1 2 3; do echo tick$i; sleep 0.35; done; echo PI_X=$PI_X SECRET=\${SECRET_KEY:-unset}; cat ${cwd}/ scripts/build.sh 2>/dev/null || cat ${cwd}/scripts/build.sh; exit 3`,
+        `for i in 1 2 3; do echo tick$i; sleep 0.35; done; echo PI_X=$PI_X SECRET=\${SECRET_KEY:-unset}; cat scripts/build.sh; exit 3`,
         cwd,
         { onData: (d) => chunks.push({ t: Date.now() - t0, s: d.toString() }), env: { PI_X: "yes", SECRET_KEY: "leak" } },
       ),
@@ -184,10 +183,12 @@ try {
   });
 
   await step("P0-1 & P0-4: multi-session apply + publish never reverts sibling session's applied files and never overwrites .env", async () => {
-    // Session A edits README.md, adds a-only.txt, and tries to create a rogue .env in bash
+    // Session A edits README.md, adds a-only.txt, and tries to create a rogue .env
     await sA.mutate("a1", "write", () => sA.writeFile(join(cwd, "README.md"), "hello from A\n"));
     await sA.mutate("a2", "write", () => sA.writeFile(join(cwd, "a-only.txt"), "made by A\n"));
-    await sA.mutate("a3", "bash", () => sA.exec("echo ROGUE=1 > .env && rm delete-me.txt", cwd, { onData: () => {} }));
+    await sA.mutate("a3", "bash", () => sA.exec("rm delete-me.txt", cwd, { onData: () => {} }));
+    const resEnv = await sA.lfs.fs.apply(sA.workBranch, [{ op: "write", path: "/.env", bytes: Buffer.from("ROGUE=1\n") }], "rogue env");
+    sA.headCommit = resEnv.commit?.id ?? resEnv.head ?? sA.headCommit;
 
     // Session B (forked from L1 before A's edits!) edits src/app.js
     await sB.mutate("b1", "write", () => sB.writeFile(join(cwd, "src/app.js"), "export const a = 222;\n"));
@@ -249,7 +250,7 @@ try {
       await sH.mutate("h1", "write", () => sH.writeFile(join(cwd, "hist/one.txt"), "1\n"));
       await sH.mutate("h2", "bash", () => sH.exec("echo 2 > hist/two.txt && rm hist/one.txt", cwd, { onData: () => {} }));
       const h3 = await sH.mutate("h3", "write", () => sH.writeFile(join(cwd, "hist/three.txt"), "3\n"));
-      const sandboxesBefore = docker("ps", "-q", "--filter", `name=^${config.prefix}`, "--filter", "label=layerfs.role=sandbox").stdout.trim().split("\n").filter(Boolean).length;
+      const daemonsBefore = pgrep(`layerfs-daemon --config ${sH.spec.localDir}/`).stdout.trim().split("\n").filter(Boolean).length;
 
       const v = await loadHistory(sH);
       assert.equal(v.rows.length, 3);
@@ -264,8 +265,8 @@ try {
       assert.match(text, /\+hist\/three\.txt/);
       assert.match(text, /Not yet applied: \d+ file/);
 
-      const sandboxesAfter = docker("ps", "-q", "--filter", `name=^${config.prefix}`, "--filter", "label=layerfs.role=sandbox").stdout.trim().split("\n").filter(Boolean).length;
-      assert.equal(sandboxesAfter, sandboxesBefore, "history must not start a Sandbox");
+      const daemonsAfter = pgrep(`layerfs-daemon --config ${sH.spec.localDir}/`).stdout.trim().split("\n").filter(Boolean).length;
+      assert.equal(daemonsAfter, daemonsBefore, "history must not start a daemon");
 
       // /tree back to h2: history shows h2 as HEAD and no h3
       await sH.switchToRef(v.rows[1].id);
@@ -283,7 +284,7 @@ try {
       assert.match(formatHistory(v3), /Everything on this branch is applied/);
       return text.split("\n").slice(0, 4).join(" / ");
     } finally {
-      await sH.close();
+      await sH.close({ stopDaemons: true });
     }
   });
 
@@ -298,15 +299,12 @@ try {
     assert.equal((await sC.readFile(join(cwd, "a-only.txt"))).toString(), "made by A\n");
   });
 } finally {
-  await sA?.close().catch(() => {});
-  await sB?.close().catch(() => {});
-  await sC?.close().catch(() => {});
-  const left = docker("ps", "-aq", "--filter", `name=^${config.prefix}`).stdout.trim().split("\n").filter(Boolean);
-  if (left.length) docker("rm", "-f", ...left);
-  const vols = docker("volume", "ls", "-q", "--filter", `name=^${config.prefix}`).stdout.trim().split("\n").filter(Boolean);
-  if (vols.length) docker("volume", "rm", ...vols);
+  await sA?.close({ stopDaemons: true }).catch(() => {});
+  await sB?.close({ stopDaemons: true }).catch(() => {});
+  await sC?.close({ stopDaemons: true }).catch(() => {});
+  await stopNativeDaemons(join(config.root, "local")).catch(() => {});
   const failed = results.filter((r) => !r.ok);
-  console.log(`\n${results.length - failed.length}/${results.length} passed; cleaned ${left.length} containers, ${vols.length} volumes`);
+  console.log(`\n${results.length - failed.length}/${results.length} passed (zero Docker)`);
   await fsp.rm(base, { recursive: true, force: true }).catch(() => {});
   process.exit(failed.length ? 1 : 0);
 }

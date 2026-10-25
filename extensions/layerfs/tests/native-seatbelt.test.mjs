@@ -307,9 +307,9 @@ try {
     const pwnedFile = join(base, "pwned-p02.txt");
     rmSync(pwnedFile, { force: true });
 
-    // Create symlinks in workspace via bash (including a dangling final symlink pointing to a non-existent file outside workspace, AND a valid in-workspace symlink)
+    // Create symlinks in workspace via bash (including a dangling final symlink AND a 2-hop chained dangling symlink pointing outside workspace, plus a valid in-workspace symlink)
     await sA.mutate("sec-p02-sym", "bash", () =>
-      sA.exec(`ln -s ~/.ssh/config sym-read && ln -s "${base}" sym-dir && ln -s "${pwnedFile}" sym-dangling && ln -s src/app.js sym-valid-in-ws`, cwd, { onData: () => {} })
+      sA.exec(`ln -s ~/.ssh/config sym-read && ln -s "${base}" sym-dir && ln -s "${pwnedFile}" sym-dangling && ln -s sym-dangling sym-chain-dangling && ln -s src/app.js sym-valid-in-ws`, cwd, { onData: () => {} })
     );
 
     // Valid in-workspace symlink write MUST succeed and update the target inside the workspace
@@ -321,7 +321,7 @@ try {
     // readFile on sym-read pointing to secret must be refused
     await assert.rejects(
       sA.readFile(join(cwd, "sym-read")),
-      (e) => e.code === "ENOENT"
+      (e) => e.code === "ENOENT" || e.code === "EPERM"
     );
 
     // writeFile through sym-dir pointing outside workspace must be refused
@@ -332,6 +332,11 @@ try {
     // writeFile through dangling final symlink pointing outside workspace must ALSO be refused
     await assert.rejects(
       sA.writeFile(join(cwd, "sym-dangling"), "hacked"),
+      /refusing to write through a symlink pointing outside the LayerFS workspace/
+    );
+    // writeFile through 2-hop chained dangling symlink (sym-chain-dangling -> sym-dangling -> outside) must ALSO be refused
+    await assert.rejects(
+      sA.writeFile(join(cwd, "sym-chain-dangling"), "hacked"),
       /refusing to write through a symlink pointing outside the LayerFS workspace/
     );
     assert.equal(existsSync(pwnedFile), false, "file outside workspace must never be written through symlink");

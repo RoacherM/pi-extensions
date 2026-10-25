@@ -3,9 +3,10 @@
 // Run: node tests/concurrent-start.test.mjs
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { stopNativeDaemons } from "../src/workspace.ts";
 
 const id = Date.now().toString(36);
 const base = join(homedir(), ".cache/pi-layerfs-test", `cs-${id}`);
@@ -36,15 +37,16 @@ try {
   for (const r of runs) assert.equal(r.code, 0, r.out.slice(-600));
   const projects = new Set(runs.map((r) => r.out.match(/^OK (\S+)/m)?.[1]));
   assert.equal(projects.size, 1, `all sessions share one project: ${[...projects]}`);
+  const storesDir = join(base, "root/stores");
+  const storeDirs = existsSync(storesDir) ? readdirSync(storesDir).filter((d) => !d.startsWith(".")) : [];
+  assert.equal(storeDirs.length, 1, `expected 1 shared project store, got: ${storeDirs}`);
   ok = true;
   console.log(`PASS ${N} concurrent processes opened one shared project (${Date.now() - t0} ms)`);
 } catch (e) {
   console.log(`FAIL ${e.message}`);
 } finally {
-  const ids = spawnSync("docker", ["ps", "-aq", "--filter", `name=^${prefix}`], { encoding: "utf8" }).stdout.split(/\s+/).filter(Boolean);
-  if (ids.length) spawnSync("docker", ["rm", "-f", ...ids]);
-  const vols = spawnSync("docker", ["volume", "ls", "-q", "--filter", `name=^${prefix}`], { encoding: "utf8" }).stdout.split(/\s+/).filter(Boolean);
-  if (vols.length) spawnSync("docker", ["volume", "rm", ...vols]);
-  console.log(`${ok ? 1 : 0}/1 passed; cleaned ${ids.length} containers, ${vols.length} volumes`);
+  await stopNativeDaemons(join(base, "root/local")).catch(() => {});
+  rmSync(base, { recursive: true, force: true });
+  console.log(`${ok ? 1 : 0}/1 passed (zero Docker)`);
   process.exit(ok ? 0 : 1);
 }

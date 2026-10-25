@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { stopNativeDaemons } from "../src/workspace.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const id = Date.now().toString(36);
@@ -15,7 +16,7 @@ const cwd = join(base, "project");
 mkdirSync(cwd, { recursive: true });
 writeFileSync(join(cwd, "a.txt"), "host a\n");
 const PREFIX = `pi-lfs-rt-${id}-`;
-const docker = (...a) => spawnSync("docker", a, { encoding: "utf8" });
+const pgrep = (pattern) => spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
 const results = [];
 const step = async (name, fn) => {
   try {
@@ -69,8 +70,8 @@ try {
     await waitFor(settledAfter(n), "agent settled");
     assert.equal(readFileSync(join(cwd, "a.txt"), "utf8"), "host a\n");
     assert.equal(existsSync(join(cwd, "new.txt")), false);
-    const sb = docker("ps", "-q", "--filter", `name=^${PREFIX}`, "--filter", "label=layerfs.role=sandbox").stdout.trim();
-    assert.equal(sb, "", "Store-direct writes in RPC mode must start 0 Sandboxes");
+    const daemons = pgrep(`layerfs-daemon --config ${join(base, "lfs/local")}/`).stdout.trim();
+    assert.equal(daemons, "", "Store-direct writes in RPC mode must start 0 daemons");
     const st = await waitFor(ui("setStatus", (m) => /2 unapplied/.test(m.statusText ?? "")), "checkpoint status");
     return st.statusText;
   });
@@ -110,11 +111,8 @@ try {
   });
 } finally {
   if (child.exitCode === null) child.kill("SIGKILL");
-  const left = docker("ps", "-aq", "--filter", `name=^${PREFIX}`).stdout.trim().split("\n").filter(Boolean);
-  if (left.length) docker("rm", "-f", ...left);
-  const vols = docker("volume", "ls", "-q", "--filter", `name=^${PREFIX}`).stdout.trim().split("\n").filter(Boolean);
-  if (vols.length) docker("volume", "rm", ...vols);
-  console.log(`\n${results.filter(Boolean).length}/${results.length} passed; cleaned ${left.length} containers, ${vols.length} volumes`);
+  await stopNativeDaemons(join(base, "lfs/local")).catch(() => {});
+  console.log(`\n${results.filter(Boolean).length}/${results.length} passed (zero Docker)`);
   rmSync(base, { recursive: true, force: true });
   process.exit(results.every(Boolean) ? 0 : 1);
 }

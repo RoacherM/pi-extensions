@@ -7,14 +7,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { resolveConfig } from "../src/config.ts";
 import { acquireLock } from "../src/lock.ts";
-import { isExcludedPath, LayerfsSession } from "../src/workspace.ts";
+import { isExcludedPath, LayerfsSession, stopNativeDaemons } from "../src/workspace.ts";
 import { formatHistory, loadHistory } from "../src/history.ts";
 import layerfsExtension from "../src/index.ts";
 
 const id = Date.now().toString(36);
 const base = join(homedir(), ".cache/pi-layerfs-test", `fix-${id}`);
 const config = { ...resolveConfig({}), root: join(base, "root"), prefix: `pi-lfs-fx-${id}-`, killGraceMs: 800, excludes: [...resolveConfig({}).excludes, "secrets/"] };
-const docker = (...a) => spawnSync("docker", a, { encoding: "utf8" });
+const pgrep = (pattern) => spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
 const results = [];
 const step = async (name, fn) => {
   const t0 = Date.now();
@@ -74,9 +74,9 @@ try {
     const s = await open(cwd, "p");
     const o = out();
     const sibling = `${cwd}-old/x`;
-    const r = await s.mutate("b1", "bash", () => s.exec(`pwd; cat ${cwd}/a.txt; printf 'root=%s\\nsibling=%s\\n' "${cwd}" "${sibling}" > conf.txt; cat conf.txt`, cwd, o));
+    const r = await s.mutate("b1", "bash", () => s.exec(`cat a.txt; echo blocked > "${cwd}/a.txt" 2>&1 || true; printf 'root=%s\\nsibling=%s\\n' "${cwd}" "${sibling}" > conf.txt; cat conf.txt`, cwd, o));
     assert.equal(r.value.exitCode, 0, o.text());
-    assert.match(o.text(), new RegExp(`^${cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\n`), "pwd is the host path");
+    assert.match(o.text(), /Operation not permitted/, "writing to host cwd is blocked by Seatbelt");
     const conf = (await s.readFile(join(cwd, "conf.txt"))).toString();
     assert.equal(conf, `root=${cwd}\nsibling=${sibling}\n`, "file content keeps host paths verbatim");
     assert.doesNotMatch(o.text(), /\/workspaces\//);
@@ -90,8 +90,8 @@ try {
     await b.mutate("y", "write", () => b.writeFile(join(cwd, "who.txt"), "B\n"));
     const oa = out(), ob = out();
     await Promise.all([
-      a.exec(`sleep 0.4; cat ${cwd}/who.txt`, cwd, oa),
-      b.exec(`sleep 0.4; cat ${cwd}/who.txt`, cwd, ob),
+      a.exec(`sleep 0.4; cat who.txt`, cwd, oa),
+      b.exec(`sleep 0.4; cat who.txt`, cwd, ob),
     ]);
     assert.equal(oa.text().trim(), "A");
     assert.equal(ob.text().trim(), "B");
@@ -105,8 +105,8 @@ try {
     ac.abort(); // immediately, likely before the SID file exists
     await assert.rejects(p, /aborted/);
     await assert.rejects(s.exec("sleep 30", cwd, { onData: () => {}, timeout: 1 }), /timeout:1/);
-    const ctr = docker("ps", "--filter", `name=^${config.prefix}${s.project}-`, "--format", "{{.Names}}").stdout.trim().split("\n")[0];
-    if (ctr) assert.equal(docker("exec", ctr, "sh", "-c", "pgrep -f 'sleep (300|30)' || true").stdout.trim(), "");
+    const left = pgrep("sleep (300|30)").stdout.trim();
+    assert.equal(left, "", "no lingering sleep processes");
   });
 
   await step("#4 grep: a glob with quotes/shell syntax is data, not code", async () => {
@@ -114,8 +114,7 @@ try {
     const s = await open(cwd, "g");
     const marker = `/tmp/pwned-${id}`;
     await s.grepWorkspace({ pattern: "x\\s*=", path: ".", glob: `*.js';touch ${marker};'` }).catch(() => {});
-    const ctr = docker("ps", "--filter", `name=^${config.prefix}${s.project}-`, "--format", "{{.Names}}").stdout.trim().split("\n")[0];
-    if (ctr) assert.equal(docker("exec", ctr, "sh", "-c", `test -e ${marker} && echo yes || echo no`).stdout.trim(), "no", "no command injection");
+    assert.equal(existsSync(marker), false, "no command injection");
     const ok = await s.grepWorkspace({ pattern: "x\\s*=", path: ".", glob: "*.js" });
     assert.equal(ok.matches, 1);
   });
@@ -236,8 +235,7 @@ try {
     const s = await open(cwd, "n1");
     const r = await s.exec("nohup sh -c 'sleep 200' >/dev/null 2>&1 & (setsid sleep 201 &) ; echo started", cwd, { onData: () => {} });
     assert.equal(r.exitCode, 0);
-    const ctr = docker("ps", "--filter", `name=^${config.prefix}${s.project}-`, "--format", "{{.Names}}").stdout.trim().split("\n")[0];
-    const left = ctr ? docker("exec", ctr, "sh", "-c", "pgrep -f 'sleep 20[01]' || true").stdout.trim() : "";
+    const left = pgrep("sleep 20[01]").stdout.trim();
     assert.equal(left, "", `leftover background processes: ${left}`);
   });
 
@@ -384,14 +382,18 @@ try {
     assert.deepEqual((await lead.apply()).applied.sort(), ["lead.txt", "w2.txt"]);
   });
 
-  await step("bash keeps working after the Sandbox container restarts (runner reinstalled, not cached)", async () => {
+  await step("bash keeps working after the Sandbox daemon restarts", async () => {
     const cwd = project();
     const s = await open(cwd, "rr");
     const o1 = out();
     await s.mutate("1", "bash", () => s.exec("echo one", cwd, o1));
-    const ctrs = docker("ps", "--format", "{{.Names}}", "--filter", `name=^${config.prefix}`).stdout.split("\n").filter((n) => n && !n.endsWith("store"));
-    assert.ok(ctrs.length, "a Sandbox container exists");
-    for (const c of ctrs) docker("exec", "-u", "0", c, "sh", "-c", "rm -f /run/pi-lfs/pi-lfs-run-*.sh"); // what a restart does to /run
+    assert.match(o1.text(), /one/);
+    // Kill the project's layerfs-daemon process with SIGTERM
+    const daemonPids = pgrep(`layerfs-daemon --config ${s.spec.localDir}/`).stdout.trim().split(/\s+/).filter(Boolean);
+    for (const pid of daemonPids) {
+      try { process.kill(Number(pid), "SIGTERM"); } catch {}
+    }
+    await new Promise((r) => setTimeout(r, 200));
     const o2 = out();
     const r = await s.mutate("2", "bash", () => s.exec("echo two", cwd, o2));
     assert.equal(r.value.exitCode, 0, o2.text());
@@ -612,7 +614,7 @@ try {
 
     // Lead runs exec
     const chunks = [];
-    await lead.mutate("2", "bash", () => lead.exec("stat -c %Y main.rs && stat -c %Y target/debug/app", cwd, { onData: (d) => chunks.push(d.toString()) }));
+    await lead.mutate("2", "bash", () => lead.exec("(stat -f %m main.rs 2>/dev/null || stat -c %Y main.rs) && (stat -f %m target/debug/app 2>/dev/null || stat -c %Y target/debug/app)", cwd, { onData: (d) => chunks.push(d.toString()) }));
     const [srcMtime, appMtime] = chunks.join("").trim().split(/\s+/).map(Number);
     assert.ok(srcMtime >= appMtime, `main.rs (${srcMtime}) must be >= target/debug/app (${appMtime})`);
   });
@@ -664,7 +666,7 @@ try {
       assert.equal(r.fallback, true, "fallback merge was used");
 
       // Verify test.sh exists and is executable on lead
-      const rExec = await lead.sh("stat -c %a test.sh && stat -c %a run.sh && readlink link-test.sh");
+      const rExec = await lead.sh("(stat -f %Lp test.sh 2>/dev/null || stat -c %a test.sh) && (stat -f %Lp run.sh 2>/dev/null || stat -c %a run.sh) && readlink link-test.sh");
       assert.equal(rExec.code, 0);
       const lines = rExec.stdout.trim().split("\n");
       assert.ok(parseInt(lines[0], 8) & 0o111, "test.sh is executable");
@@ -691,12 +693,9 @@ try {
   });
 
 } finally {
-  for (const s of sessions) await s.close().catch(() => {});
-  const left = docker("ps", "-aq", "--filter", `name=^${config.prefix}`).stdout.trim().split("\n").filter(Boolean);
-  if (left.length) docker("rm", "-f", ...left);
-  const vols = docker("volume", "ls", "-q", "--filter", `name=^${config.prefix}`).stdout.trim().split("\n").filter(Boolean);
-  if (vols.length) docker("volume", "rm", ...vols);
-  console.log(`\n${results.filter(Boolean).length}/${results.length} passed; cleaned ${left.length} containers, ${vols.length} volumes`);
+  for (const s of sessions) await s.close({ stopDaemons: true }).catch(() => {});
+  await stopNativeDaemons(join(config.root, "local")).catch(() => {});
+  console.log(`\n${results.filter(Boolean).length}/${results.length} passed (zero Docker)`);
   await fsp.rm(base, { recursive: true, force: true }).catch(() => {});
   process.exit(results.every(Boolean) ? 0 : 1);
 }

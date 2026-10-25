@@ -1,7 +1,7 @@
 {
   "name": "@roacherm/pi-layerfs",
   "version": "0.2.0",
-  "description": "Pi extension: run file tools and shell commands in an isolated LayerFS branch; your folder changes only on /layerfs apply. Optional, needs Docker.",
+  "description": "Pi extension: run file tools and shell commands in an isolated LayerFS branch; your folder changes only on /layerfs apply. 100% Native on macOS (Seatbelt sandbox-exec + NFSv3 loopback, zero Docker).",
   "type": "module",
   "license": "MIT",
   "author": "RoacherM",
@@ -23,6 +23,10 @@
   "engines": {
     "node": ">=22.19"
   },
+  "exports": {
+    ".": "./src/index.ts",
+    "./core": "./src/core/index.ts"
+  },
   "files": [
     "src/",
     "scripts/setup-layerfs.sh",
@@ -42,7 +46,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "scripts": {
-    "test": "node tests/backend.test.mjs && node tests/review-fixes.test.mjs && node tests/pi.test.mjs && node tests/cli.test.mjs && node tests/rpc.test.mjs && node tests/scale.test.mjs",
+    "test": "node tests/native-seatbelt.test.mjs && node tests/backend.test.mjs && node tests/review-fixes.test.mjs && node tests/pi.test.mjs && node tests/cli.test.mjs && node tests/rpc.test.mjs && node tests/scale.test.mjs",
     "test:native": "node tests/native-seatbelt.test.mjs",
     "test:backend": "node tests/backend.test.mjs",
     "test:fixes": "node tests/review-fixes.test.mjs",

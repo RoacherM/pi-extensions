@@ -2,10 +2,11 @@
 // Run: node tests/cli.test.mjs
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { stopNativeDaemons } from "../src/workspace.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const id = Date.now().toString(36);
@@ -14,7 +15,6 @@ const cwd = join(base, "project");
 mkdirSync(cwd, { recursive: true });
 writeFileSync(join(cwd, "a.txt"), "host a\n");
 const PREFIX = `pi-lfs-ct-${id}-`;
-const docker = (...a) => spawnSync("docker", a, { encoding: "utf8" });
 const results = [];
 const step = (name, fn) => {
   try {
@@ -68,14 +68,15 @@ try {
       assert.equal(a.status, 0, a.stderr.slice(-600));
       assert.equal(b.status, 0, b.stderr.slice(-600));
       assert.equal(existsSync(join(cwd, "same.txt")), false);
-      const vols = docker("volume", "ls", "-q", "--filter", `name=^${PREFIX}`).stdout.trim().split("\n").filter(Boolean);
-      assert.equal(vols.length, 1, `expected 1 shared project volume, got: ${vols}`);
+      const storesDir = join(base, "lfs/stores");
+      const storeDirs = existsSync(storesDir) ? readdirSync(storesDir).filter((d) => !d.startsWith(".")) : [];
+      assert.equal(storeDirs.length, 1, `expected 1 shared project store, got: ${storeDirs}`);
       const bindings = JSON.parse(readFileSync(join(base, "lfs/state/bindings.json"), "utf8"));
       const sessions = Object.entries(bindings.sessions);
       console.log("  sessions:", JSON.stringify(sessions.map(([k, v]) => [k, v.workBranch])));
       assert.ok(sessions.length >= 2, `sessions recorded in bindings.json: ${sessions.length}`);
       assert.equal(new Set(sessions.map(([, v]) => v.workBranch)).size, sessions.length, "each session has its own branch");
-      return `both exit 0 in ${Date.now() - t0} ms on shared volume ${vols[0]}`;
+      return `both exit 0 in ${Date.now() - t0} ms on shared store ${storeDirs[0]}`;
     });
   })();
 
@@ -85,18 +86,15 @@ try {
     assert.equal(readFileSync(join(cwd, "c.txt"), "utf8"), "host c\n");
   });
 
-  step("missing Docker image: run reports the error; nothing written to host", () => {
-    const r = pi([[["write", { path: "d.txt", content: "x" }]]], [], { PI_LAYERFS_IMAGE: "pi-lfs-missing:none" });
+  step("missing bundle: run reports the error; nothing written to host", () => {
+    const r = pi([[["write", { path: "d.txt", content: "x" }]]], [], { PI_LAYERFS_BUNDLE: "/tmp/nonexistent-bundle" });
     assert.equal(existsSync(join(cwd, "d.txt")), false);
     assert.match(r.stdout + r.stderr, /SCRIPT_DONE/);
     return `exit ${r.status}`;
   });
 } finally {
-  const left = docker("ps", "-aq", "--filter", `name=^${PREFIX}`).stdout.trim().split("\n").filter(Boolean);
-  if (left.length) docker("rm", "-f", ...left);
-  const vols = docker("volume", "ls", "-q", "--filter", `name=^${PREFIX}`).stdout.trim().split("\n").filter(Boolean);
-  if (vols.length) docker("volume", "rm", ...vols);
-  console.log(`\n${results.filter(Boolean).length}/${results.length} passed; cleaned ${left.length} containers, ${vols.length} volumes`);
+  await stopNativeDaemons(join(base, "lfs/local")).catch(() => {});
+  console.log(`\n${results.filter(Boolean).length}/${results.length} passed (zero Docker)`);
   rmSync(base, { recursive: true, force: true });
   process.exit(results.every(Boolean) ? 0 : 1);
 }
