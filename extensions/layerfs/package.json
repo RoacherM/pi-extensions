@@ -26,6 +26,7 @@
   "files": [
     "src/",
     "scripts/setup-layerfs.sh",
+    "scripts/setup-layerfs-native.sh",
     "docs/EPI-INTEGRATION.md",
     "docs/DESIGN-v0.2.md",
     "README.md",
@@ -42,6 +43,7 @@
   },
   "scripts": {
     "test": "node tests/backend.test.mjs && node tests/review-fixes.test.mjs && node tests/pi.test.mjs && node tests/cli.test.mjs && node tests/rpc.test.mjs && node tests/scale.test.mjs",
+    "test:native": "node tests/native-seatbelt.test.mjs",
     "test:backend": "node tests/backend.test.mjs",
     "test:fixes": "node tests/review-fixes.test.mjs",
     "test:pi": "node tests/pi.test.mjs",

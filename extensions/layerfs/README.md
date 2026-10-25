@@ -126,7 +126,9 @@ Typical flow: ask the agent to change things → `/layerfs diff` → `/layerfs a
 | Env | Default |
 |---|---|
 | `PI_LAYERFS` | on; `0` turns it off |
-| `PI_LAYERFS_BUNDLE` | `~/.cache/epi-layerfs/bundle-5fb68dd` |
+| `PI_LAYERFS_SANDBOX` | `docker`. Set `native` on macOS to run with **zero Docker** (built-in NFSv3 loopback + `/sbin/mount_nfs` + Claude Code `srt`-style Seatbelt `sandbox-exec`). |
+| `PI_LAYERFS_NETWORK` | `allow` (in `native` mode). Set `localhost` or `deny` (`offline`) to block outbound network access inside `bash` via Seatbelt while keeping LayerFS NFSv3 mounts active. |
+| `PI_LAYERFS_BUNDLE` | `~/.cache/epi-layerfs/bundle-5fb68dd` (`docker`) or `~/.cache/epi-layerfs/bundle-native` (`native`) |
 | `PI_LAYERFS_IMAGE` | `epi-lfs-runtime:node24-5fb68dd` |
 | `PI_LAYERFS_ROOT` | `~/.cache/pi-layerfs` (LayerFS home, bindings, manifests) |
 | `PI_LAYERFS_PREFIX` | `pi-lfs-` (container and volume names) |

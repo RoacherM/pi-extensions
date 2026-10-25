@@ -1,12 +1,13 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { constants as fsc, mkdtempSync, promises as fsp, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { constants as fsc, existsSync, mkdtempSync, promises as fsp, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { BindingStore, type HostEntry, type HostIndex, type ProjectRecord, type SessionBinding } from "./bindings.ts";
 import type { LayerfsConfig } from "./config.ts";
 import { DockerError, dockerEnv, ok, run } from "./docker.ts";
 import { type BoxSpec, createProjectClient, ensureStoreBox } from "./port/client.ts";
+import { bothSpellings, buildSeatbeltProfile } from "./seatbelt.ts";
 
 export interface Workspace { sandbox: string; path: string; image?: string }
 export interface Checkpoint { origins: string[]; label: string; commit: string | null; branch: string; changed: boolean; at: number }
@@ -68,6 +69,8 @@ export class LayerfsSession {
   readonly config: LayerfsConfig;
   readonly log: Log;
 
+  get isNative(): boolean { return this.config.sandbox === "native"; }
+
   bindings!: BindingStore;
   boxSpec!: BoxSpec;
   projectRecord!: ProjectRecord;
@@ -114,6 +117,13 @@ export class LayerfsSession {
     for (const f of ["layerfs.node", "layerfs-daemon", "sdk/js/src/index.js"]) {
       try { await fsp.access(join(config.bundle, f), fsc.R_OK); } catch { problems.push(`missing ${join(config.bundle, f)}`); }
     }
+    if (config.sandbox === "native") {
+      for (const bin of ["/sbin/mount_nfs", "/usr/bin/sandbox-exec"]) {
+        try { await fsp.access(bin, fsc.X_OK); } catch { problems.push(`missing or non-executable ${bin}`); }
+      }
+      if (problems.length) throw new LayerfsError("Preflight", `LayerFS is not available: ${problems.join("; ")}`);
+      return "native";
+    }
     const info = await run(config.docker, ["info", "--format", "{{.OSType}}"], { timeoutMs: 15_000 }).catch((e) => ({ code: -1, stdout: Buffer.from(""), stderr: e.message }));
     if (info.code !== 0) problems.push(`Docker is not reachable (${info.stderr.trim().slice(0, 200)})`);
     let imageId = "";
@@ -155,6 +165,9 @@ export class LayerfsSession {
     const homeEntry = join(this.boxSpec.home, p.name);
     const hasHome = await fsp.access(homeEntry).then(() => true, () => false);
     if (!hasHome) return false;
+    if (this.isNative) {
+      return fsp.access(join(this.boxSpec.stores!, p.volume, "global", "store.sqlite")).then(() => true, () => false);
+    }
     const v = await run(this.config.docker, ["volume", "inspect", p.volume], { timeoutMs: 10_000 });
     return v.code === 0;
   }
@@ -197,7 +210,11 @@ export class LayerfsSession {
         // branch-only build output (target/, caches) is generated: the newer side wins on merge too
         if (!hadLww) await fsp.writeFile(lwwPath, LWW_DEFAULT + this.config.branchOnly.map((p) => `${p}\n`).join(""));
 
-        await ok(this.config.docker, ["volume", "create", "--label", "pi-layerfs.role=project", "--label", `pi-layerfs.project=${name}`, volume]);
+        if (this.isNative) {
+          await fsp.mkdir(join(this.boxSpec.stores!, volume), { recursive: true, mode: 0o700 });
+        } else {
+          await ok(this.config.docker, ["volume", "create", "--label", "pi-layerfs.role=project", "--label", `pi-layerfs.project=${name}`, volume]);
+        }
         const record: ProjectRecord = { name, source: this.cwd, volume, image: imageId, mainRef: "", created, updatedAt: created };
         const client = await createProjectClient(this.boxSpec, record);
         this.lfs = client.lfs;
@@ -206,8 +223,13 @@ export class LayerfsSession {
           const initRes = await this.lfs.project.init(staged);
           record.mainRef = initRes.layer;
         } catch (e) {
-          await run(this.config.docker, ["volume", "rm", volume]).catch(() => {});
-          await run(this.config.docker, ["exec", this.boxSpec.box, "rm", "-rf", join(this.boxSpec.home, name)]).catch(() => {});
+          if (this.isNative) {
+            await fsp.rm(join(this.boxSpec.stores!, volume), { recursive: true, force: true }).catch(() => {});
+            await fsp.rm(join(this.boxSpec.home, name), { recursive: true, force: true }).catch(() => {});
+          } else {
+            await run(this.config.docker, ["volume", "rm", volume]).catch(() => {});
+            await run(this.config.docker, ["exec", this.boxSpec.box, "rm", "-rf", join(this.boxSpec.home, name)]).catch(() => {});
+          }
           throw e;
         }
         this.bindings.writeHostIndex(name, hostIndex);
@@ -301,7 +323,7 @@ export class LayerfsSession {
         `find . \\( -name .git -prune \\) -o \\( -type f -o -type l \\) -print0 | while IFS= read -r -d '' f; do`,
         `  f="\${f#./}"`,
         `  if [ -L "$f" ]; then printf 'L\\t%s\\t%s\\0' "$f" "$(readlink -- "$f")"`,
-        `  else printf 'F\\t%s\\t%s\\t%s\\0' "$f" "$(sha256sum -- "$f" | cut -d' ' -f1)" "$(stat -c %a -- "$f")"; fi`,
+        `  else printf 'F\\t%s\\t%s\\t%s\\0' "$f" "$( (sha256sum -- "$f" 2>/dev/null || shasum -a 256 -- "$f") | cut -d' ' -f1)" "$(stat -c %a -- "$f" 2>/dev/null || stat -f %Lp -- "$f")"; fi`,
         `done`,
       ].join("\n");
       const r = await this.dexec(ctr, ident, `exec bash -c "$2" _ "$1"`, [wsPath, script]);
@@ -1147,6 +1169,13 @@ export class LayerfsSession {
     } catch (e: any) {
       if (e?.code === "NotDirectory" || e?.code === "NoSuchPath") {
         const rel = sp.replace(/^\/+/, "");
+        if (this.isNative) {
+          return this.withMountedBranch(this.workBranch, false, "readdir", async (_ctr, _ident, wsPath) => {
+            const dir = posix.join(wsPath, rel);
+            const entries = await fsp.readdir(dir).catch(() => []);
+            return entries.filter((n) => n && n !== ".lww" && !isExcludedPath(rel ? `${rel}/${n}` : n, this.config.excludes)).sort();
+          });
+        }
         return this.withMountedBranch(this.workBranch, false, "readdir", async (ctr, ident, wsPath) => {
           const r = await this.dexec(ctr, ident, `find "$1" -mindepth 1 -maxdepth 1 -printf '%f\\0'`, [posix.join(wsPath, rel)]);
           if (r.code !== 0) throw enoent(hostPath, r.stderr);
@@ -1242,13 +1271,13 @@ export class LayerfsSession {
       return { lines, matches, limitReached: false };
     }
 
-    // Regex, ignoreCase or context lines -> short mount running GNU grep -P
+    // Regex, ignoreCase or context lines -> short mount running GNU grep -P (or BSD grep -E on native)
     return this.withMountedBranch(this.workBranch, false, "grep", async (ctr, ident, wsPath) => {
       const rel = sp.replace(/^\/+/, "");
       const targetWs = rel ? posix.join(wsPath, rel) : wsPath;
       const flags = [
         "-rnIH", "--exclude=.lww", "--exclude-dir=.git", "--exclude-dir=node_modules",
-        params.ignoreCase ? "-i" : "", params.literal ? "-F" : "-P",
+        params.ignoreCase ? "-i" : "", params.literal ? "-F" : (this.isNative ? "-E" : "-P"),
         params.context ? `-C${Math.floor(params.context)}` : "",
         ...(globPatterns ? globPatterns.map((g) => `--include=${g}`) : []),
       ].filter(Boolean);
@@ -1279,6 +1308,9 @@ export class LayerfsSession {
   // ---------------------------------------------------------------- on-demand Workspace mount & bash executor
 
   private async containerAndIdent(ws: Workspace): Promise<{ container: string; ident: string }> {
+    if (this.isNative) {
+      return { container: "native", ident: `${process.getuid?.() ?? 501}:${process.getgid?.() ?? 20}` };
+    }
     const container = `${this.config.prefix}${this.projectRecord.name}-${ws.sandbox}`;
     let ident = this.identByContainer.get(container);
     if (!ident) {
@@ -1291,6 +1323,9 @@ export class LayerfsSession {
   }
 
   private async dexec(container: string, ident: string, script: string, args: string[] = [], input?: Buffer | string) {
+    if (this.isNative) {
+      return run("/bin/sh", ["-c", script, "_", ...args], { input, timeoutMs: 120_000 });
+    }
     const r = await run(
       this.config.docker,
       ["exec", ...(input !== undefined ? ["-i"] : []), "-u", ident, "-e", "HOME=/tmp", container, "sh", "-c", script, "_", ...args],
@@ -1315,9 +1350,10 @@ export class LayerfsSession {
   ): Promise<T> {
     const ws = await this.lfs.workspace.mount(branch);
     const { container, ident } = await this.containerAndIdent(ws);
+    const wsPath = this.isNative ? (await fsp.realpath(ws.path).catch(() => ws.path)) : ws.path;
     let keepMounted = false;
     try {
-      const value = await fn(container, ident, ws.path, ws);
+      const value = await fn(container, ident, wsPath, ws);
       if (commitAfter) {
         const res = await this.lfs.workspace.commit(ws, message.slice(0, 4000));
         this.lastStoreCommit = { kind: res.kind, head: res.commit?.id ?? res.head ?? null };
@@ -1336,7 +1372,7 @@ export class LayerfsSession {
       throw e;
     } finally {
       if (!keepMounted) {
-        await this.reapHolders(container, ident, ws.path).catch(() => {});
+        await this.reapHolders(container, ident, wsPath).catch(() => {});
         await this.lfs.workspace.unmount(ws, !commitAfter).catch(() => {});
       }
     }
@@ -1363,6 +1399,120 @@ export class LayerfsSession {
     options: { onData: (d: Buffer) => void; signal?: AbortSignal; timeout?: number; env?: NodeJS.ProcessEnv },
   ): Promise<{ exitCode: number | null }> {
     if (options.signal?.aborted) throw new Error("aborted");
+
+    if (this.isNative) {
+      const ws = await this.lfs.workspace.mount(this.workBranch);
+      const wsReal = await fsp.realpath(ws.path).catch(() => ws.path);
+
+      if (this.touchPathsOnNextExec.size > 0) {
+        const paths = [...this.touchPathsOnNextExec];
+        this.touchPathsOnNextExec.clear();
+        for (const p of paths) {
+          const full = join(wsReal, p);
+          try {
+            const now = new Date();
+            await fsp.utimes(full, now, now).catch(() => {});
+          } catch {}
+        }
+      }
+
+      await this.prepareNativeGit(wsReal);
+
+      const scratchDir = join(this.config.root, "scratch", this.projectRecord.name, this.logicalBranch);
+      await fsp.mkdir(scratchDir, { recursive: true });
+
+      const relCwd = this.toRel(hostCwd);
+      const runCwd = relCwd ? join(wsReal, relCwd) : wsReal;
+
+      const profile = buildSeatbeltProfile({
+        wsPath: wsReal,
+        hostCwd: this.cwd,
+        scratchDir,
+        excludes: this.config.excludes,
+        outsideSecrets: OUTSIDE_SECRET_PATTERNS,
+        network: this.config.network,
+      });
+
+      const childEnv: NodeJS.ProcessEnv = {
+        HOME: homedir(),
+        PATH: process.env.PATH || "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        TMPDIR: "/private/tmp",
+        USER: process.env.USER || "user",
+        LOGNAME: process.env.LOGNAME || "user",
+      };
+      for (const [k, v] of Object.entries(options.env ?? process.env)) {
+        if (typeof v === "string" && (k.startsWith("PI_") || this.config.envAllow.includes(k))) {
+          childEnv[k] = v;
+        }
+      }
+
+      const child = spawn(
+        "/usr/bin/sandbox-exec",
+        ["-p", profile, "/bin/bash", "-c", command],
+        { cwd: runCwd, env: childEnv, stdio: ["ignore", "pipe", "pipe"], detached: true },
+      );
+      child.stdout.on("data", options.onData);
+      child.stderr.on("data", options.onData);
+
+      const tag = `${this.shortId}-${randomBytes(4).toString("hex")}`;
+      let stopping: Promise<void> | null = null;
+      let killFailed: unknown = null;
+      const kill = () => (stopping ??= this.killNativeSession(child, wsReal).catch((e) => { killFailed = e; }));
+      this.activeSids.set(tag, kill);
+
+      let timedOut = false;
+      const timer = options.timeout && options.timeout > 0 ? setTimeout(() => { timedOut = true; void kill(); }, options.timeout * 1000) : undefined;
+      const onAbort = () => void kill();
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      if (options.signal?.aborted) void kill();
+
+      let keepMounted = false;
+      try {
+        const code = await new Promise<number | null>((resolveCode, reject) => {
+          child.on("error", reject);
+          child.on("close", (c) => resolveCode(c));
+        });
+        if (stopping) await stopping;
+        if (killFailed) {
+          keepMounted = true;
+          this.blocked = { reason: "a cancelled command could not be stopped inside the Sandbox", heldWs: ws };
+          throw killFailed;
+        }
+
+        await this.reapHolders("native", "", wsReal).catch(() => {});
+
+        const lwwFile = join(wsReal, ".lww");
+        if (!existsSync(lwwFile)) {
+          writeFileSync(lwwFile, LWW_DEFAULT + this.config.branchOnly.map((p) => `${p}\n`).join(""));
+        }
+
+        const msg = `pi bash (exit ${code ?? "sig"}) [${this.pendingOrigins.join(",") || "bash"}]`.slice(0, 4000);
+        try {
+          const res = await this.lfs.workspace.commit(ws, msg);
+          this.lastStoreCommit = { kind: res.kind, head: res.commit?.id ?? res.head ?? null };
+        } catch (ce: any) {
+          keepMounted = true;
+          this.blocked = { reason: `${ce?.code ?? "Error"}: ${String(ce?.message ?? ce).slice(0, 200)}`, heldWs: ws };
+        }
+
+        if (options.signal?.aborted) throw new Error("aborted");
+        if (timedOut) throw new Error(`timeout:${options.timeout}`);
+        return { exitCode: code };
+      } finally {
+        if (timer) clearTimeout(timer);
+        options.signal?.removeEventListener("abort", onAbort);
+        this.activeSids.delete(tag);
+        if (!keepMounted) {
+          const u = (async () => {
+            await this.reapHolders("native", "", wsReal).catch(() => {});
+            await this.lfs.workspace.unmount(ws).catch(() => {});
+          })();
+          if (options.signal?.aborted || timedOut) this.pendingUnmounts.add(u.finally(() => this.pendingUnmounts.delete(u)));
+          else await u;
+        }
+      }
+    }
+
     const ws = await this.lfs.workspace.mount(this.workBranch);
     const { container, ident } = await this.containerAndIdent(ws);
     const [uid, gid] = ident.split(":");
@@ -1506,11 +1656,90 @@ export class LayerfsSession {
 
   /** Kills only processes of this Workspace: cwd inside it (path compared literally, no glob). */
   private async reapHolders(container: string, ident: string, wsPath: string): Promise<void> {
+    if (this.isNative) {
+      const spellings = bothSpellings(wsPath);
+      for (const p of spellings) {
+        const r = await run("lsof", ["-t", "+D", p], { timeoutMs: 5000 }).catch(() => null);
+        if (r?.stdout && r.stdout.length > 0) {
+          const pids = r.stdout.toString().split(/\s+/).filter(Boolean);
+          for (const pid of pids) {
+            const n = Number(pid);
+            if (n > 0 && n !== process.pid) {
+              try { process.kill(n, "SIGKILL"); } catch {}
+            }
+          }
+        }
+      }
+      return;
+    }
     await run(this.config.docker, [
       "exec", "-u", ident, container, "sh", "-c",
       `for p in /proc/[0-9]*; do c=$(readlink "$p/cwd" 2>/dev/null) || continue; if [ "$c" = "$1" ] || [ "\${c#"$1"/}" != "$c" ]; then kill -KILL "\${p#/proc/}" 2>/dev/null; fi; done; true`,
       "_", wsPath,
     ]);
+  }
+
+  private async prepareNativeGit(wsReal: string): Promise<void> {
+    const hasGit = await fsp.access(join(wsReal, ".git")).then(() => true, () => false);
+    if (!hasGit) return;
+    const infoDir = join(wsReal, ".git", "info");
+    await fsp.mkdir(infoDir, { recursive: true });
+    const excludePath = join(infoDir, "exclude");
+    const existing = await fsp.readFile(excludePath, "utf8").catch(() => "");
+    if (!existing.split("\n").includes("/.lww")) {
+      await fsp.appendFile(excludePath, (existing.length && !existing.endsWith("\n") ? "\n" : "") + "/.lww\n").catch(() => {});
+    }
+    if (this.config.excludes.length > 0) {
+      const excludesFlat = this.config.excludes.flatMap(expandBraces).filter(Boolean);
+      const excludeArgs = excludesFlat.flatMap((pat) => [`:(glob,icase)${pat}`, `:(glob,icase)**/${pat}`]);
+      const ls = await run("git", ["-C", wsReal, "-c", "core.quotePath=false", "ls-files", "-v", "--", ...excludeArgs], { timeoutMs: 10_000 }).catch(() => null);
+      if (ls?.code === 0 && ls.stdout.length > 0) {
+        const lines = ls.stdout.toString().split("\n");
+        const skipFiles: string[] = [];
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const [tag, ...rest] = line.split(" ");
+          const f = rest.join(" ");
+          if (tag !== "S" && f) {
+            const exists = await fsp.access(join(wsReal, f)).then(() => true, () => false);
+            if (!exists) skipFiles.push(f);
+          }
+        }
+        if (skipFiles.length > 0) {
+          await run("git", ["-C", wsReal, "update-index", "--skip-worktree", "--", ...skipFiles], { timeoutMs: 10_000 }).catch(() => null);
+        }
+      }
+    }
+  }
+
+  private async killNativeSession(child: ReturnType<typeof spawn>, wsReal: string): Promise<void> {
+    const pid = child.pid;
+    if (!pid) return;
+    try {
+      process.kill(-pid, "SIGTERM");
+    } catch {
+      try { child.kill("SIGTERM"); } catch {}
+    }
+    const grace = Math.max(100, this.config.killGraceMs);
+    const start = Date.now();
+    let alive = true;
+    while (Date.now() - start < grace) {
+      await new Promise((r) => setTimeout(r, 50));
+      try {
+        process.kill(-pid, 0);
+      } catch {
+        alive = false;
+        break;
+      }
+    }
+    if (alive) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        try { child.kill("SIGKILL"); } catch {}
+      }
+    }
+    await this.reapHolders("native", "", wsReal).catch(() => {});
   }
 
   // ---------------------------------------------------------------- mutation queue & checkpoint gate
@@ -1633,7 +1862,7 @@ export class LayerfsSession {
       }
       const cat = await this.dexec(ctr, ident, `cat -- "$1"`, [p]);
       if (cat.code !== 0) return null;
-      const m = await this.dexec(ctr, ident, `stat -c %a -- "$1"`, [p]);
+      const m = await this.dexec(ctr, ident, `stat -c %a -- "$1" 2>/dev/null || stat -f %Lp -- "$1"`, [p]);
       return fileSig(cat.stdout, parseInt(m.stdout.toString().trim() || "644", 8));
     });
   }
@@ -1714,7 +1943,7 @@ export class LayerfsSession {
             } else {
               const cat = await this.dexec(ctr, ident, `cat -- "$1"`, [p]);
               if (cat.code !== 0) throw new Error(`cannot read ${rel}: ${cat.stderr}`);
-              const st = await this.dexec(ctr, ident, `stat -c %a -- "$1"`, [p]);
+              const st = await this.dexec(ctr, ident, `stat -c %a -- "$1" 2>/dev/null || stat -f %Lp -- "$1"`, [p]);
               next = { kind: "file", data: cat.stdout, mode: parseInt(st.stdout.toString().trim() || "644", 8) };
             }
           }
@@ -1921,7 +2150,12 @@ export class LayerfsSession {
 
   // ---------------------------------------------------------------- shutdown
 
-  async close(): Promise<{ kept: boolean; notes: string[] }> {
+  async stopNativeDaemons(): Promise<void> {
+    if (!this.isNative || !this.boxSpec?.localDir) return;
+    return stopNativeDaemons(this.boxSpec.localDir);
+  }
+
+  async close(options: { stopDaemons?: boolean } = {}): Promise<{ kept: boolean; notes: string[] }> {
     const notes: string[] = [];
     if (this.closed) return { kept: true, notes };
     this.closed = true;
@@ -1932,6 +2166,9 @@ export class LayerfsSession {
     }
     this.persistSessionBinding();
     try { await this.lfs?.close?.(); } catch {}
+    if (this.isNative && options.stopDaemons) {
+      await this.stopNativeDaemons().catch(() => {});
+    }
     if (this.unapplied || this.blocked) {
       notes.push(`unapplied changes remain on branch ${this.workBranch} in project ${this.project} (volume ${this.volume})`);
     }
@@ -2165,6 +2402,21 @@ function runLocal(cmd: string, args: string[]): Promise<{ code: number | null; s
     child.on("error", (e) => resolveRun({ code: -1, stderr: e.message }));
     child.on("close", (code) => resolveRun({ code, stderr }));
   });
+}
+
+export async function stopNativeDaemons(localDir?: string): Promise<void> {
+  const pattern = localDir ? `layerfs-daemon --config ${localDir}/` : "layerfs-daemon --config ";
+  const r = await run("pgrep", ["-f", pattern]).catch(() => null);
+  if (r?.code === 0 && r.stdout.length > 0) {
+    const pids = r.stdout.toString().split(/\s+/).filter(Boolean);
+    for (const pid of pids) {
+      const n = Number(pid);
+      if (n > 0 && n !== process.pid) {
+        try { process.kill(n, "SIGTERM"); } catch {}
+      }
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
 }
 
 export { DockerError };
